@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+electron/node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Builds
+frontend/dist/
+electron/dist/
+backend/dist/
+backend/build/
+*.spec.bak
+
+# Packaged / installed copies (rebuild with scripts/package-windows.ps1)
+The app/
+
+# Runtime
+logs/*.csv
+!logs/.gitkeep
+tiles/**/*.png
+!tiles/.gitkeep
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env
+.env
+.env.*
+*.log

@@ -1,0 +1,78 @@
+{
+  "name": "studsat-ground-station",
+  "version": "1.0.0",
+  "description": "STUDSAT dual-vehicle offline ground station",
+  "main": "main.js",
+  "author": "STUDSAT",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis",
+    "dist:dir": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "team.studsat.groundstation",
+    "productName": "STUDSAT Ground Station",
+    "copyright": "Copyright © STUDSAT",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/dist/studsat-backend.exe",
+        "to": "backend/studsat-backend.exe"
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../tiles",
+        "to": "tiles",
+        "filter": ["**/*", "!.gitkeep"]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "STUDSAT-Ground-Station-${version}-${arch}.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "STUDSAT Ground Station",
+      "uninstallDisplayName": "STUDSAT Ground Station",
+      "artifactName": "STUDSAT-Ground-Station-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "STUDSAT-Ground-Station-Portable-${version}.${ext}"
+    },
+    "forceCodeSigning": false
+  }
+}
