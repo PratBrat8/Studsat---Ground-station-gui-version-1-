@@ -4,11 +4,12 @@ import {
   startReplaySession,
   stopReplaySession,
 } from '../../services/vehicleBridge.js';
+import CommandLog from '../command/CommandLog.jsx';
 
 const SPEEDS = [0.25, 0.5, 1, 2, 5, 10];
 
 /**
- * Session list + play/pause/speed for CSV replay (PRD A.6.3 / Phase 10).
+ * Session list + play/pause/speed + session command log (PRD A.6.3 / Phase 12).
  */
 export default function ReplayControls({ onVehicleChange }) {
   const [sessions, setSessions] = useState([]);
@@ -17,6 +18,7 @@ export default function ReplayControls({ onVehicleChange }) {
   const [status, setStatus] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [sessionCommands, setSessionCommands] = useState([]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -45,6 +47,25 @@ export default function ReplayControls({ onVehicleChange }) {
     const t = setInterval(refreshStatus, 500);
     return () => clearInterval(t);
   }, [refreshSessions, refreshStatus]);
+
+  useEffect(() => {
+    if (!selected) {
+      setSessionCommands([]);
+      return undefined;
+    }
+    let cancelled = false;
+    api
+      .fetchReplayCommands(selected)
+      .then((data) => {
+        if (!cancelled) setSessionCommands(data.commands || []);
+      })
+      .catch(() => {
+        if (!cancelled) setSessionCommands([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
   const onPlay = async () => {
     if (!selected) {
@@ -113,8 +134,8 @@ export default function ReplayControls({ onVehicleChange }) {
           <h1>Replay</h1>
           <p className="muted">
             Load a logged CSV and scrub through the <strong>same</strong> live
-            panels (HUD, map, graphs, packet monitor). Backend re-feeds the real
-            protocol parser — not a UI-only mock.
+            panels (HUD, map, graphs, packet monitor). Backend re-feeds +RCV
+            into RadioLineBuffer. Session command log is shown with telemetry.
           </p>
         </div>
         <button
@@ -152,7 +173,7 @@ export default function ReplayControls({ onVehicleChange }) {
             {sessions.map((s) => (
               <option key={s.filename} value={s.filename}>
                 {s.filename} · {s.vehicle} · {s.sample_count} samples ·{' '}
-                {s.duration_s}s
+                {s.command_count || 0} cmds · {s.duration_s}s
               </option>
             ))}
           </select>
@@ -225,9 +246,18 @@ export default function ReplayControls({ onVehicleChange }) {
       {!sessions.length && (
         <div className="banner info">
           No session logs yet. Run <strong>Start simulation</strong> on Rocket or
-          Satellite — CSV is written continuously to <code>logs/</code>.
+          Satellite — telemetry CSV and a sibling command log are written to{' '}
+          <code>logs/</code>.
         </div>
       )}
+
+      {selected ? (
+        <CommandLog
+          heading="Session command log"
+          emptyLabel="No uplink commands in this session."
+          commands={sessionCommands}
+        />
+      ) : null}
     </div>
   );
 }

@@ -44,13 +44,14 @@ function RateSparkline({ values, width = 160, height = 36 }) {
 }
 
 /**
- * Protocol-level Packet Monitor (PRD C.5 / Phase 8).
- * Real hex + parsed fields + counters + rate — not decorative.
+ * Protocol-level Packet Monitor (PRD v2 Phase 10 / C.5).
+ * RSSI/SNR plus transport-layer errors alongside application CSV parse errors.
  */
 export default function PacketMonitor({ vehicle }) {
   const useStore = useVehicleStore(vehicle);
   const packets = useStore((s) => s.packets);
   const link = useStore((s) => s.link);
+  const signal = useStore((s) => s.signal);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [pollExtra, setPollExtra] = useState(null);
 
@@ -94,11 +95,21 @@ export default function PacketMonitor({ vehicle }) {
     pollExtra?.rate_history || packets?.rate_history || [];
 
   const framesOk = pollExtra?.frames_ok ?? packets?.frames_ok ?? link.frames_ok ?? 0;
-  const crcErr =
+  const transportBad =
+    pollExtra?.transport_malformed ??
+    packets?.transport_malformed ??
     pollExtra?.frames_crc_error ??
     packets?.frames_crc_error ??
     link.crc_error_count ??
     0;
+  const transportErr =
+    pollExtra?.transport_err ?? packets?.transport_err ?? 0;
+  const appErr =
+    pollExtra?.app_parse_error ?? packets?.app_parse_error ?? 0;
+  const appField =
+    pollExtra?.app_field_count_error ?? packets?.app_field_count_error ?? 0;
+  const appType =
+    pollExtra?.app_type_error ?? packets?.app_type_error ?? 0;
   const resync =
     pollExtra?.frames_resynced ?? packets?.frames_resynced ?? 0;
   const rate =
@@ -109,7 +120,12 @@ export default function PacketMonitor({ vehicle }) {
   const seqGap =
     pollExtra?.last_seq_gap ?? packets?.last_seq_gap ?? link.last_seq_gap ?? 0;
   const age =
-    pollExtra?.last_packet_age_s ?? link.last_packet_age_s ?? null;
+    pollExtra?.last_packet_age_s ??
+    packets?.last_packet_age_s ??
+    link.last_packet_age_s ??
+    null;
+  const rssi = pollExtra?.rssi ?? packets?.rssi ?? signal?.rssi ?? null;
+  const snr = pollExtra?.snr ?? packets?.snr ?? signal?.snr ?? null;
 
   // Clamp selection
   const safeIdx = recent.length
@@ -128,7 +144,7 @@ export default function PacketMonitor({ vehicle }) {
         <div>
           <h2 className="section-title">Packet monitor</h2>
           <p className="muted small" style={{ margin: '0.15rem 0 0' }}>
-            Live protocol debug · real frames through parser/CRC
+            Reyax AT + CSV · transport errors vs application parse errors
           </p>
         </div>
         <RateSparkline values={rateHistory} />
@@ -140,15 +156,38 @@ export default function PacketMonitor({ vehicle }) {
           <div className="vg-value">{fmt(rate, 1, 'Hz')}</div>
         </div>
         <div className="pkt-stat">
-          <div className="vg-label">OK</div>
+          <div className="vg-label">RX OK</div>
           <div className="vg-value">{framesOk}</div>
         </div>
-        <div className={`pkt-stat ${crcErr > 0 ? 'warn' : ''}`}>
-          <div className="vg-label">CRC err</div>
-          <div className="vg-value">{crcErr}</div>
+        <div className="pkt-stat">
+          <div className="vg-label">RSSI</div>
+          <div className="vg-value">
+            {rssi == null ? '—' : `${fmt(rssi, 0)} dBm`}
+          </div>
+        </div>
+        <div className="pkt-stat">
+          <div className="vg-label">SNR</div>
+          <div className="vg-value">{snr == null ? '—' : fmt(snr, 1)}</div>
+        </div>
+        <div className={`pkt-stat ${transportBad > 0 ? 'warn' : ''}`}>
+          <div className="vg-label">RX malformed</div>
+          <div className="vg-value">{transportBad}</div>
+        </div>
+        <div className={`pkt-stat ${transportErr > 0 ? 'warn' : ''}`}>
+          <div className="vg-label">TX +ERR</div>
+          <div className="vg-value">{transportErr}</div>
+        </div>
+        <div className={`pkt-stat ${appErr > 0 ? 'warn' : ''}`}>
+          <div className="vg-label">CSV err</div>
+          <div className="vg-value">{appErr}</div>
+          {(appField > 0 || appType > 0) && (
+            <div className="vg-sub">
+              {appField} field · {appType} type
+            </div>
+          )}
         </div>
         <div className={`pkt-stat ${resync > 0 ? 'warn' : ''}`}>
-          <div className="vg-label">Resync</div>
+          <div className="vg-label">Oversize</div>
           <div className="vg-value">{resync}</div>
         </div>
         <div className="pkt-stat">
@@ -180,14 +219,22 @@ export default function PacketMonitor({ vehicle }) {
                 aria-selected={i === safeIdx}
                 className={`packet-list-item ${i === safeIdx ? 'active' : ''} ${
                   pkt.ok === false ? 'bad' : ''
-                }`}
+                } ${pkt.layer === 'transport' ? 'transport' : ''}`}
                 onClick={() => setSelectedIdx(i)}
               >
                 <span className="pkt-type">
-                  {pkt.type_name || `0x${Number(pkt.type).toString(16)}`}
+                  {pkt.type_name || pkt.type || 'frame'}
                 </span>
-                <span className="pkt-seq">#{pkt.seq}</span>
-                <span className="pkt-len">{pkt.len}B</span>
+                <span className="pkt-rssi">
+                  {pkt.rssi == null ? '—' : `${pkt.rssi}`}
+                </span>
+                <span className="pkt-seq">
+                  {pkt.layer === 'transport'
+                    ? 'AT'
+                    : pkt.seq == null
+                      ? '—'
+                      : `#${pkt.seq}`}
+                </span>
                 <span className="pkt-flag">{pkt.ok === false ? 'ERR' : 'OK'}</span>
               </button>
             ))}
@@ -195,8 +242,8 @@ export default function PacketMonitor({ vehicle }) {
         </div>
 
         <div className="packet-detail-col">
-          <div className="vg-label">Hex (full frame)</div>
-          <HexView hex={selected?.hex || ''} />
+          <div className="vg-label">Hex (AT ASCII line)</div>
+          <HexView hex={selected?.hex || ''} highlightCrc={false} mode="at" />
           <div className="vg-label" style={{ marginTop: '0.65rem' }}>
             Parsed fields
           </div>

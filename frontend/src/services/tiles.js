@@ -1,5 +1,5 @@
 /**
- * Offline tile URL helpers (PRD Phase 6).
+ * Offline tile URL helpers (PRD v2 Phase 7 / G8).
  * Never points at OpenStreetMap / MapTiler / any internet host.
  */
 

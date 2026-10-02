@@ -1,332 +1,238 @@
 """
-Wire protocol for STUDSAT ground-station telemetry (PRD C.2).
+Application-layer protocol — competition CSV telemetry + CMD builders (PRD v2 C.3).
 
-[ASSUMED] frame layout — isolated here so firmware format changes are a
-one-file edit. Mirror field order/sizes in firmware and (later) protocol.ts.
+This module does not speak Reyax AT. Radio framing is radio_transport.py.
 
-Frame (serial byte stream, little-endian payloads):
+TEMPORARY/UNCONFIRMED (Appendix 1.1): CSV layout assumes 3 separate
+accelerometer fields and 3 separate gyro fields (19 columns total).
+Confirm against a real firmware sample line before flight.
 
-  SYNC0 | SYNC1 | VEHICLE_ID | PACKET_TYPE | SEQ | LEN | PAYLOAD[N] | CRC16
-  0xAA    0x55     1 B           1 B          1 B   1 B    N B         2 B
+TEMPORARY/UNCONFIRMED (Appendix 1.3): firmware is assumed NOT to send
+an application-level command ACK. Do not parse or invent ACKED here.
 
-CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, xorout 0x0000, refin/refout false.
-CRC covers VEHICLE_ID .. end of PAYLOAD (not sync bytes, not CRC itself).
+TEMPORARY/UNCONFIRMED (Appendix 1.7): cmd_manual_ejection() builds
+CMD,<TEAM_ID>,EJ,R — routing that string onto the Rocket/Avionics
+Reyax (not CanSat) is the serial/command layer's job.
 """
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Union
+from typing import List, Optional, Sequence
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-SYNC0 = 0xAA
-SYNC1 = 0x55
+from app.config import TEAM_ID
 
+# Pipeline ids (not Reyax module addresses — those live in config.py).
 VEHICLE_ROCKET = 0x01
 VEHICLE_SATELLITE = 0x02
+VEHICLE_CANSAT = VEHICLE_SATELLITE
 
-TYPE_TELEMETRY = 0x01
-TYPE_GPS = 0x02
-TYPE_STATUS = 0x03
-TYPE_EVENT = 0x04
-
-HEADER_SIZE = 4  # VEHICLE_ID + TYPE + SEQ + LEN
-CRC_SIZE = 2
-SYNC_SIZE = 2
-MIN_FRAME_SIZE = SYNC_SIZE + HEADER_SIZE + CRC_SIZE  # 8, zero-length payload
-
-# Payload struct formats (little-endian)
-# TELEMETRY: u32 + 13×f32 = 4 + 52 = 56
-_TELEMETRY_FMT = "<I13f"
-TELEMETRY_PAYLOAD_SIZE = struct.calcsize(_TELEMETRY_FMT)  # 56
-
-# GPS: u32 + 2×f64 + f32 + u8 + f32 + u8 = 4+16+4+1+4+1 = 30
-_GPS_FMT = "<IddfBfB"
-GPS_PAYLOAD_SIZE = struct.calcsize(_GPS_FMT)  # 30
-
-# STATUS: u8 + f32 + u8 = 6
-_STATUS_FMT = "<BfB"
-STATUS_PAYLOAD_SIZE = struct.calcsize(_STATUS_FMT)  # 6
-
-MAX_PAYLOAD_LEN = 255
-MAX_EVENT_LEN = 200
-
-
-class VehicleId(IntEnum):
-    ROCKET = VEHICLE_ROCKET
-    SATELLITE = VEHICLE_SATELLITE
+# TEMPORARY/UNCONFIRMED — 19 fields, accel/gyro split into 3 axes each.
+CSV_FIELDS: Sequence[str] = (
+    "TEAM_ID",
+    "TIMESTAMP",
+    "PACKET_COUNT",
+    "ALTITUDE",
+    "PRESSURE",
+    "TEMP",
+    "VOLTAGE",
+    "GNSS_TIME",
+    "GNSS_LAT",
+    "GNSS_LON",
+    "GNSS_ALT",
+    "GNSS_SATS",
+    "ACCEL_X",
+    "ACCEL_Y",
+    "ACCEL_Z",
+    "GYRO_X",
+    "GYRO_Y",
+    "GYRO_Z",
+    "FLIGHT_SOFTWARE_STATE",
+)
+CSV_FIELD_COUNT = len(CSV_FIELDS)  # 19
 
 
-class PacketType(IntEnum):
-    TELEMETRY = TYPE_TELEMETRY
-    GPS = TYPE_GPS
-    STATUS = TYPE_STATUS
-    EVENT = TYPE_EVENT
+class FlightState(IntEnum):
+    """CDR 8-state flight software field (PRD v2 B.3)."""
+
+    BOOT = 0
+    TEST_MODE = 1
+    LAUNCH_PAD = 2
+    ASCENT = 3
+    PAYLOAD_SEP = 4
+    DESCENT = 5
+    AEROBREAK_RELEASE = 6
+    IMPACT = 7
 
 
-# ---------------------------------------------------------------------------
-# CRC-16/CCITT-FALSE
-# ---------------------------------------------------------------------------
-def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
-    """CRC-16/CCITT-FALSE over *data* (poly 0x1021, init 0xFFFF)."""
-    crc = init & 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
+FLIGHT_STATE_NAMES = {
+    FlightState.BOOT: "BOOT",
+    FlightState.TEST_MODE: "TEST_MODE",
+    FlightState.LAUNCH_PAD: "LAUNCH_PAD",
+    FlightState.ASCENT: "ASCENT",
+    FlightState.PAYLOAD_SEP: "PAYLOAD_SEP",
+    FlightState.DESCENT: "DESCENT",
+    FlightState.AEROBREAK_RELEASE: "AEROBREAK_RELEASE",
+    FlightState.IMPACT: "IMPACT",
+}
 
 
-# ---------------------------------------------------------------------------
-# Typed payload dataclasses
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
-class TelemetryFrame:
-    timestamp_ms: int
+class TelemetryRecord:
+    team_id: str
+    timestamp: str
+    packet_count: int
     altitude_m: float
-    pressure_hpa: float
-    temperature_c: float
+    pressure: float
+    temp_c: float
+    voltage: float
+    gnss_time: str
+    gnss_lat: float
+    gnss_lon: float
+    gnss_alt_m: float
+    gnss_sats: int
     accel_x: float
     accel_y: float
     accel_z: float
     gyro_x: float
     gyro_y: float
     gyro_z: float
-    pitch: float
-    yaw: float
-    roll: float
-    battery_v: float
+    flight_software_state: int
 
 
-@dataclass(frozen=True, slots=True)
-class GpsFrame:
-    gps_timestamp: int
-    lat: float
-    lon: float
-    alt_msl_m: float
-    num_sats: int
-    hdop: float
-    fix_type: int  # 0=no fix, 1=2D, 2=3D
+@dataclass
+class CsvParseStats:
+    ok: int = 0
+    field_count_error: int = 0
+    type_error: int = 0
+
+    @property
+    def errors(self) -> int:
+        return self.field_count_error + self.type_error
+
+    def reset(self) -> None:
+        self.ok = 0
+        self.field_count_error = 0
+        self.type_error = 0
 
 
-@dataclass(frozen=True, slots=True)
-class StatusFrame:
-    phase_hint: int  # 0 = let ground station decide
-    battery_v: float
-    error_flags: int
+def _f(value: str) -> float:
+    return float(value.strip())
 
 
-@dataclass(frozen=True, slots=True)
-class EventFrame:
-    message: str
+def _i(value: str) -> int:
+    return int(value.strip())
 
 
-DecodedPayload = Union[TelemetryFrame, GpsFrame, StatusFrame, EventFrame]
+def parse_telemetry_csv(
+    data: str,
+    stats: Optional[CsvParseStats] = None,
+) -> Optional[TelemetryRecord]:
+    """
+    Split a competition CSV line, validate count + types.
+
+    Returns None (and increments stats) on any mismatch — never raises.
+    """
+    if data is None:
+        if stats is not None:
+            stats.field_count_error += 1
+        return None
+    line = data.strip("\r\n")
+    if not line:
+        if stats is not None:
+            stats.field_count_error += 1
+        return None
+    parts: List[str] = line.split(",")
+    if len(parts) != CSV_FIELD_COUNT:
+        if stats is not None:
+            stats.field_count_error += 1
+        return None
+    try:
+        record = TelemetryRecord(
+            team_id=parts[0].strip(),
+            timestamp=parts[1].strip(),
+            packet_count=_i(parts[2]),
+            altitude_m=_f(parts[3]),
+            pressure=_f(parts[4]),
+            temp_c=_f(parts[5]),
+            voltage=_f(parts[6]),
+            gnss_time=parts[7].strip(),
+            gnss_lat=_f(parts[8]),
+            gnss_lon=_f(parts[9]),
+            gnss_alt_m=_f(parts[10]),
+            gnss_sats=_i(parts[11]),
+            accel_x=_f(parts[12]),
+            accel_y=_f(parts[13]),
+            accel_z=_f(parts[14]),
+            gyro_x=_f(parts[15]),
+            gyro_y=_f(parts[16]),
+            gyro_z=_f(parts[17]),
+            flight_software_state=_i(parts[18]),
+        )
+    except (TypeError, ValueError):
+        if stats is not None:
+            stats.type_error += 1
+        return None
+    if stats is not None:
+        stats.ok += 1
+    return record
 
 
-@dataclass(frozen=True, slots=True)
-class RawFrame:
-    """Validated frame after CRC check; payload still raw bytes."""
-
-    vehicle_id: int
-    packet_type: int
-    seq: int
-    payload: bytes
-    # Full on-wire bytes including sync + CRC (for Packet Monitor hex view)
-    raw_bytes: bytes
-
-
-class ProtocolError(ValueError):
-    """Raised when encode/decode inputs are invalid (never from live parser path)."""
-
-
-# ---------------------------------------------------------------------------
-# Encode
-# ---------------------------------------------------------------------------
-def encode_telemetry(frame: TelemetryFrame) -> bytes:
-    return struct.pack(
-        _TELEMETRY_FMT,
-        int(frame.timestamp_ms) & 0xFFFFFFFF,
-        float(frame.altitude_m),
-        float(frame.pressure_hpa),
-        float(frame.temperature_c),
-        float(frame.accel_x),
-        float(frame.accel_y),
-        float(frame.accel_z),
-        float(frame.gyro_x),
-        float(frame.gyro_y),
-        float(frame.gyro_z),
-        float(frame.pitch),
-        float(frame.yaw),
-        float(frame.roll),
-        float(frame.battery_v),
-    )
-
-
-def encode_gps(frame: GpsFrame) -> bytes:
-    return struct.pack(
-        _GPS_FMT,
-        int(frame.gps_timestamp) & 0xFFFFFFFF,
-        float(frame.lat),
-        float(frame.lon),
-        float(frame.alt_msl_m),
-        int(frame.num_sats) & 0xFF,
-        float(frame.hdop),
-        int(frame.fix_type) & 0xFF,
-    )
-
-
-def encode_status(frame: StatusFrame) -> bytes:
-    return struct.pack(
-        _STATUS_FMT,
-        int(frame.phase_hint) & 0xFF,
-        float(frame.battery_v),
-        int(frame.error_flags) & 0xFF,
-    )
-
-
-def encode_event(frame: EventFrame) -> bytes:
-    raw = frame.message.encode("utf-8")
-    if len(raw) > MAX_EVENT_LEN:
-        raise ProtocolError(f"event message too long: {len(raw)} > {MAX_EVENT_LEN}")
-    return raw
-
-
-def encode_frame(
-    vehicle_id: int,
-    packet_type: int,
-    seq: int,
-    payload: bytes,
-) -> bytes:
-    """Build a complete on-wire frame (sync + header + payload + CRC)."""
-    if not (0 <= vehicle_id <= 0xFF):
-        raise ProtocolError(f"vehicle_id out of range: {vehicle_id}")
-    if not (0 <= packet_type <= 0xFF):
-        raise ProtocolError(f"packet_type out of range: {packet_type}")
-    if not (0 <= seq <= 0xFF):
-        raise ProtocolError(f"seq out of range: {seq}")
-    if len(payload) > MAX_PAYLOAD_LEN:
-        raise ProtocolError(f"payload too long: {len(payload)}")
-
-    header = bytes(
+def format_telemetry_csv(record: TelemetryRecord) -> str:
+    """Serialize a record to the 19-field CSV line (no trailing CR/LF)."""
+    return ",".join(
         [
-            vehicle_id & 0xFF,
-            packet_type & 0xFF,
-            seq & 0xFF,
-            len(payload) & 0xFF,
+            str(record.team_id),
+            str(record.timestamp),
+            str(int(record.packet_count)),
+            f"{record.altitude_m:.2f}",
+            f"{record.pressure:.2f}",
+            f"{record.temp_c:.2f}",
+            f"{record.voltage:.2f}",
+            str(record.gnss_time),
+            f"{record.gnss_lat:.6f}",
+            f"{record.gnss_lon:.6f}",
+            f"{record.gnss_alt_m:.2f}",
+            str(int(record.gnss_sats)),
+            f"{record.accel_x:.3f}",
+            f"{record.accel_y:.3f}",
+            f"{record.accel_z:.3f}",
+            f"{record.gyro_x:.3f}",
+            f"{record.gyro_y:.3f}",
+            f"{record.gyro_z:.3f}",
+            str(int(record.flight_software_state)),
         ]
     )
-    body = header + payload
-    crc = crc16_ccitt(body)
-    crc_bytes = struct.pack("<H", crc)  # little-endian CRC on wire
-    return bytes([SYNC0, SYNC1]) + body + crc_bytes
 
 
-def encode_packet(
-    vehicle_id: int,
-    seq: int,
-    decoded: DecodedPayload,
-) -> bytes:
-    """Encode a typed payload dataclass into a full wire frame."""
-    if isinstance(decoded, TelemetryFrame):
-        return encode_frame(vehicle_id, TYPE_TELEMETRY, seq, encode_telemetry(decoded))
-    if isinstance(decoded, GpsFrame):
-        return encode_frame(vehicle_id, TYPE_GPS, seq, encode_gps(decoded))
-    if isinstance(decoded, StatusFrame):
-        return encode_frame(vehicle_id, TYPE_STATUS, seq, encode_status(decoded))
-    if isinstance(decoded, EventFrame):
-        return encode_frame(vehicle_id, TYPE_EVENT, seq, encode_event(decoded))
-    raise ProtocolError(f"unknown payload type: {type(decoded)!r}")
+def cmd_telemetry_power(team_id: str, on: bool) -> str:
+    return f"CMD,{team_id},TX,{'ON' if on else 'OFF'}"
 
 
-# ---------------------------------------------------------------------------
-# Decode
-# ---------------------------------------------------------------------------
-def decode_telemetry(payload: bytes) -> TelemetryFrame:
-    if len(payload) != TELEMETRY_PAYLOAD_SIZE:
-        raise ProtocolError(
-            f"telemetry payload size {len(payload)} != {TELEMETRY_PAYLOAD_SIZE}"
-        )
-    fields = struct.unpack(_TELEMETRY_FMT, payload)
-    return TelemetryFrame(
-        timestamp_ms=fields[0],
-        altitude_m=fields[1],
-        pressure_hpa=fields[2],
-        temperature_c=fields[3],
-        accel_x=fields[4],
-        accel_y=fields[5],
-        accel_z=fields[6],
-        gyro_x=fields[7],
-        gyro_y=fields[8],
-        gyro_z=fields[9],
-        pitch=fields[10],
-        yaw=fields[11],
-        roll=fields[12],
-        battery_v=fields[13],
-    )
+def cmd_set_time(team_id: str, utc_time: str) -> str:
+    return f"CMD,{team_id},ST,{utc_time}"
 
 
-def decode_gps(payload: bytes) -> GpsFrame:
-    if len(payload) != GPS_PAYLOAD_SIZE:
-        raise ProtocolError(f"gps payload size {len(payload)} != {GPS_PAYLOAD_SIZE}")
-    (
-        gps_timestamp,
-        lat,
-        lon,
-        alt_msl_m,
-        num_sats,
-        hdop,
-        fix_type,
-    ) = struct.unpack(_GPS_FMT, payload)
-    return GpsFrame(
-        gps_timestamp=gps_timestamp,
-        lat=lat,
-        lon=lon,
-        alt_msl_m=alt_msl_m,
-        num_sats=num_sats,
-        hdop=hdop,
-        fix_type=fix_type,
-    )
+def cmd_calibrate(team_id: str, which: str) -> str:
+    """which: 'CG' gyro, 'CB' baro, 'CA' accel."""
+    code = which.strip().upper()
+    if code not in ("CG", "CB", "CA"):
+        raise ValueError(f"unknown calibrate code: {which}")
+    return f"CMD,{team_id},{code},R"
 
 
-def decode_status(payload: bytes) -> StatusFrame:
-    if len(payload) != STATUS_PAYLOAD_SIZE:
-        raise ProtocolError(
-            f"status payload size {len(payload)} != {STATUS_PAYLOAD_SIZE}"
-        )
-    phase_hint, battery_v, error_flags = struct.unpack(_STATUS_FMT, payload)
-    return StatusFrame(
-        phase_hint=phase_hint,
-        battery_v=battery_v,
-        error_flags=error_flags,
-    )
+def cmd_manual_ejection(team_id: str) -> str:
+    """
+    CUSTOM command (not in CDR).
+
+    TEMPORARY/UNCONFIRMED (Appendix 1.7): send on the Rocket/Avionics
+    radio line only — the Teensy owns the separation mechanism.
+    """
+    return f"CMD,{team_id},EJ,R"
 
 
-def decode_event(payload: bytes) -> EventFrame:
-    try:
-        message = payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ProtocolError(f"event payload not valid UTF-8: {exc}") from exc
-    return EventFrame(message=message)
-
-
-def decode_payload(packet_type: int, payload: bytes) -> DecodedPayload:
-    """Decode payload bytes into a typed frame (PRD C.3 protocol.py)."""
-    if packet_type == TYPE_TELEMETRY:
-        return decode_telemetry(payload)
-    if packet_type == TYPE_GPS:
-        return decode_gps(payload)
-    if packet_type == TYPE_STATUS:
-        return decode_status(payload)
-    if packet_type == TYPE_EVENT:
-        return decode_event(payload)
-    raise ProtocolError(f"unknown packet_type: 0x{packet_type:02X}")
+def default_team_id() -> str:
+    return TEAM_ID
 
 
 def vehicle_name(vehicle_id: int) -> str:
@@ -335,3 +241,14 @@ def vehicle_name(vehicle_id: int) -> str:
     if vehicle_id == VEHICLE_SATELLITE:
         return "satellite"
     return f"unknown_{vehicle_id}"
+
+
+def vehicle_reyax_addr(vehicle_id: int) -> int:
+    """Placeholder mapping pipeline id → vehicle-side Reyax address."""
+    from app.config import CANSAT_VEHICLE_ADDR, ROCKET_VEHICLE_ADDR
+
+    if vehicle_id == VEHICLE_ROCKET:
+        return ROCKET_VEHICLE_ADDR
+    if vehicle_id == VEHICLE_SATELLITE:
+        return CANSAT_VEHICLE_ADDR
+    raise ValueError(f"unsupported vehicle_id: {vehicle_id}")

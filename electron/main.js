@@ -1,8 +1,8 @@
 /**
  * Electron main process — spawns Python backend, creates window (PRD B.1 / C.7).
- * Phase 11: health watchdog + multi-restart recovery with renderer toast.
+ * Phase 13: health watchdog + multi-restart recovery with renderer toast.
  */
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const http = require('http');
@@ -290,10 +290,54 @@ function createWindow() {
     mainWindow.loadFile(indexHtml);
   }
 
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isGoogleMapsHandoffUrl(url)) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 }
+
+/** PRD A.5.10 — only https://www.google.com/maps?q=lat,lon may leave the app. */
+function isGoogleMapsHandoffUrl(url) {
+  if (typeof url !== 'string' || url.length > 200) return false;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  if (parsed.hostname !== 'www.google.com') return false;
+  if (parsed.pathname !== '/maps') return false;
+  if (parsed.hash) return false;
+  if (parsed.username || parsed.password) return false;
+  const keys = [...parsed.searchParams.keys()];
+  if (keys.length !== 1 || keys[0] !== 'q') return false;
+  const q = parsed.searchParams.get('q');
+  if (!q) return false;
+  const m = q.match(/^(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$/);
+  if (!m) return false;
+  const lat = Number(m[1]);
+  const lon = Number(m[2]);
+  return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+}
+
+ipcMain.handle('studsat:open-external', async (_event, url) => {
+  if (!isGoogleMapsHandoffUrl(url)) {
+    return { ok: false, error: 'URL is not an allowed Google Maps handoff' };
+  }
+  try {
+    await shell.openExternal(url);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+});
 
 // Renderer can request a manual backend restart (Settings / recovery)
 ipcMain.handle('studsat:restart-backend', async () => {

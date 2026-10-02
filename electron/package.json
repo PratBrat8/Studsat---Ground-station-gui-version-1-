@@ -1,6 +1,6 @@
 {
   "name": "studsat-ground-station",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "STUDSAT dual-vehicle offline ground station",
   "main": "main.js",
   "author": "STUDSAT",
@@ -38,12 +38,17 @@
       {
         "from": "../frontend/dist",
         "to": "frontend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../tiles",
         "to": "tiles",
-        "filter": ["**/*", "!.gitkeep"]
+        "filter": [
+          "**/*",
+          "!.gitkeep"
+        ]
       }
     ],
     "asar": true,
@@ -51,11 +56,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "STUDSAT-Ground-Station-${version}-${arch}.${ext}",

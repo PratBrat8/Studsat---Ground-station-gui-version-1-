@@ -7,7 +7,8 @@ import React, { useMemo } from 'react';
 export default function HexView({
   hex = '',
   bytesPerLine = 8,
-  highlightCrc = true,
+  highlightCrc = false,
+  mode = 'at',
   emptyLabel = 'No frame selected',
 }) {
   const lines = useMemo(() => {
@@ -93,11 +94,17 @@ export default function HexView({
           </div>
         ))}
       </pre>
-      <div className="hex-legend muted small">
-        <span className="hex-byte sync">AA 55</span> sync{' '}
-        <span className="hex-byte header">hdr</span> vehicle/type/seq/len{' '}
-        <span className="hex-byte crc">CRC16</span>
-      </div>
+      {mode === 'at' ? (
+        <div className="hex-legend muted small">
+          Reyax AT ASCII · +RCV=&lt;addr&gt;,&lt;len&gt;,&lt;data&gt;,&lt;rssi&gt;,&lt;snr&gt;
+        </div>
+      ) : (
+        <div className="hex-legend muted small">
+          <span className="hex-byte sync">AA 55</span> sync{' '}
+          <span className="hex-byte header">hdr</span> vehicle/type/seq/len{' '}
+          <span className="hex-byte crc">CRC16</span>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,9 +1,11 @@
 """
-Serial vehicle link — PySerial reader + FrameParser (PRD C.3 / Phase 11).
+Serial vehicle link — PySerial reader + Reyax line buffer (PRD v2 Phase 3).
 
 One SerialVehicleLink per vehicle. Auto-reconnect with backoff from config.
 Malformed serial data never crashes the process. Bad ports keep retrying
 without taking down the backend.
+
+Uplink: write(AT+SEND...) on the same COM port.
 """
 from __future__ import annotations
 
@@ -12,8 +14,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import DEFAULT_BAUD, RECONNECT_BACKOFF_S
-from app.frame_parser import FrameParser
-from app.protocol import RawFrame, vehicle_name
+from app.protocol import vehicle_name
+from app.radio_transport import RadioLine, RadioLineBuffer, RadioPacket
 
 try:
     import serial
@@ -25,7 +27,8 @@ except ImportError:  # pragma: no cover
     list_ports = None  # type: ignore
 
 LinkStateCallback = Callable[[str, str], None]
-FrameCallback = Callable[[str, RawFrame], None]
+RadioCallback = Callable[[str, RadioLine], None]
+PacketCallback = Callable[[str, RadioPacket], None]
 
 LINK_CONNECTED = "CONNECTED"
 LINK_LOST = "LINK_LOST"
@@ -92,7 +95,9 @@ class SerialVehicleLink:
         vehicle_id: int,
         port: str,
         baud: int = DEFAULT_BAUD,
-        on_frame_callback: Optional[FrameCallback] = None,
+        on_radio_callback: Optional[RadioCallback] = None,
+        on_frame_callback: Optional[PacketCallback] = None,
+        on_packet_callback: Optional[PacketCallback] = None,
         on_link_state: Optional[LinkStateCallback] = None,
         read_interval_s: float = 0.02,
     ) -> None:
@@ -105,10 +110,12 @@ class SerialVehicleLink:
             self.baud = DEFAULT_BAUD
         if self.baud <= 0 or self.baud > 10_000_000:
             self.baud = DEFAULT_BAUD
-        self._on_frame = on_frame_callback
+        self._on_radio = on_radio_callback
+        self._on_packet = on_packet_callback or on_frame_callback
         self._on_link_state = on_link_state
         self._read_interval_s = max(0.005, float(read_interval_s))
-        self._parser = FrameParser()
+        self._parser = RadioLineBuffer()
+        self._write_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = False
@@ -118,13 +125,14 @@ class SerialVehicleLink:
         self.open_failures = 0
         self.reconnect_count = 0
         self.bytes_read = 0
+        self.bytes_written = 0
 
     @property
     def is_running(self) -> bool:
         return self._running
 
     @property
-    def parser(self) -> FrameParser:
+    def parser(self) -> RadioLineBuffer:
         return self._parser
 
     @property
@@ -140,9 +148,10 @@ class SerialVehicleLink:
             "open_failures": self.open_failures,
             "reconnect_count": self.reconnect_count,
             "bytes_read": self.bytes_read,
-            "frames_ok": self._parser.frames_ok,
-            "frames_crc_error": self._parser.frames_crc_error,
-            "frames_resynced": self._parser.frames_resynced,
+            "frames_ok": self._parser.stats.rcv_ok,
+            "frames_crc_error": self._parser.stats.rcv_malformed,
+            "frames_resynced": self._parser.oversize_resets,
+            "bytes_written": self.bytes_written,
             "port_present": port_exists(self.port),
         }
 
@@ -174,6 +183,22 @@ class SerialVehicleLink:
         self._running = False
         if was:
             self._set_link(LINK_DISCONNECTED)
+
+    def write(self, data: bytes) -> bool:
+        """Send AT+SEND (or any UART bytes) to the Reyax. Never raises."""
+        if not data:
+            return False
+        ser = self._ser
+        if ser is None or not getattr(ser, "is_open", False):
+            return False
+        try:
+            with self._write_lock:
+                n = ser.write(data)
+            self.bytes_written += int(n or 0)
+            return True
+        except Exception as exc:
+            self.last_error = f"write: {type(exc).__name__}: {exc}"
+            return False
 
     def _set_link(self, state: str) -> None:
         if self._link_state == state:
@@ -279,18 +304,21 @@ class SerialVehicleLink:
 
     def _handle_bytes(self, data: bytes) -> None:
         try:
-            frames = self._parser.feed(data)
+            items = self._parser.feed(data)
         except Exception:
-            # Parser must never raise; if it does, reset framing only
             try:
                 self._parser.reset()
             except Exception:
                 pass
             return
-        if not self._on_frame:
-            return
-        for fr in frames:
-            try:
-                self._on_frame(self.vehicle_key, fr)
-            except Exception:
-                pass
+        for item in items:
+            if self._on_radio:
+                try:
+                    self._on_radio(self.vehicle_key, item)
+                except Exception:
+                    pass
+            if isinstance(item, RadioPacket) and self._on_packet:
+                try:
+                    self._on_packet(self.vehicle_key, item)
+                except Exception:
+                    pass

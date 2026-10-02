@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('studsat', {
   platform: process.platform,
   isElectron: true,
   restartBackend: () => ipcRenderer.invoke('studsat:restart-backend'),
+  openExternal: (url) => ipcRenderer.invoke('studsat:open-external', url),
   onBackendStatus: (handler) => {
     if (typeof handler !== 'function') return () => {};
     const listener = (_event, payload) => {

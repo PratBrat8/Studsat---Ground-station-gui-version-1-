@@ -6,6 +6,7 @@ Thread-safe ingest from serial/sim threads; asyncio queues notify WS clients.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set
 
 from app.config import (
+    ALTITUDE_DISAGREEMENT_THRESHOLD_M,
     GPS_TRACK_MAX_POINTS,
     PACKET_RING_SIZE,
     PREDICTION_WINDOW_SAMPLES,
@@ -21,81 +23,90 @@ from app.config import (
 )
 from app.phase_fsm import PhaseFSM, PhaseSample
 from app.predictor import LandingPredictor
+from app.power import voltage_to_percent
 from app.protocol import (
-    TYPE_EVENT,
-    TYPE_GPS,
-    TYPE_STATUS,
-    TYPE_TELEMETRY,
-    EventFrame,
-    GpsFrame,
-    ProtocolError,
-    RawFrame,
-    StatusFrame,
-    TelemetryFrame,
-    decode_payload,
+    FLIGHT_STATE_NAMES,
+    CsvParseStats,
+    FlightState,
+    TelemetryRecord,
+    parse_telemetry_csv,
 )
+from app.radio_transport import (
+    MalformedRadioLine,
+    ModuleErr,
+    ModuleOk,
+    RadioPacket,
+)
+from app.trajectory import ascent_trend, climb_angle_deg, haversine_m
 
 VEHICLES = ("rocket", "satellite")
 
-_PACKET_TYPE_NAMES = {
-    TYPE_TELEMETRY: "TELEMETRY",
-    TYPE_GPS: "GPS",
-    TYPE_STATUS: "STATUS",
-    TYPE_EVENT: "EVENT",
-}
+
+def json_safe(value: Any) -> Any:
+    """Replace NaN/Inf so WS json.dumps(..., allow_nan=False) cannot crash."""
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [json_safe(v) for v in value]
+    return value
 
 
-def _fields_from_decoded(decoded: Any) -> Dict[str, Any]:
-    """Flatten decoded dataclass to JSON-safe field map for Packet Monitor."""
-    if decoded is None:
+def _fields_from_record(rec: Optional[TelemetryRecord]) -> Dict[str, Any]:
+    if rec is None:
         return {}
+    return {
+        "team_id": rec.team_id,
+        "timestamp": rec.timestamp,
+        "packet_count": rec.packet_count,
+        "altitude_m": round(rec.altitude_m, 3),
+        "pressure": round(rec.pressure, 3),
+        "temp_c": round(rec.temp_c, 3),
+        "voltage": round(rec.voltage, 3),
+        "gnss_time": rec.gnss_time,
+        "gnss_lat": rec.gnss_lat,
+        "gnss_lon": rec.gnss_lon,
+        "gnss_alt_m": round(rec.gnss_alt_m, 3),
+        "gnss_sats": rec.gnss_sats,
+        "accel_x": round(rec.accel_x, 3),
+        "accel_y": round(rec.accel_y, 3),
+        "accel_z": round(rec.accel_z, 3),
+        "gyro_x": round(rec.gyro_x, 3),
+        "gyro_y": round(rec.gyro_y, 3),
+        "gyro_z": round(rec.gyro_z, 3),
+        "flight_software_state": rec.flight_software_state,
+    }
+
+
+def _cdr_phase_name(state: int) -> str:
     try:
-        if isinstance(decoded, TelemetryFrame):
-            return {
-                "timestamp_ms": decoded.timestamp_ms,
-                "altitude_m": round(decoded.altitude_m, 3),
-                "pressure_hpa": round(decoded.pressure_hpa, 3),
-                "temperature_c": round(decoded.temperature_c, 3),
-                "accel_x": round(decoded.accel_x, 3),
-                "accel_y": round(decoded.accel_y, 3),
-                "accel_z": round(decoded.accel_z, 3),
-                "gyro_x": round(decoded.gyro_x, 3),
-                "gyro_y": round(decoded.gyro_y, 3),
-                "gyro_z": round(decoded.gyro_z, 3),
-                "pitch": round(decoded.pitch, 3),
-                "yaw": round(decoded.yaw, 3),
-                "roll": round(decoded.roll, 3),
-                "battery_v": round(decoded.battery_v, 3),
-            }
-        if isinstance(decoded, GpsFrame):
-            return {
-                "gps_timestamp": decoded.gps_timestamp,
-                "lat": decoded.lat,
-                "lon": decoded.lon,
-                "alt_msl_m": round(decoded.alt_msl_m, 3),
-                "num_sats": decoded.num_sats,
-                "hdop": round(decoded.hdop, 3),
-                "fix_type": decoded.fix_type,
-            }
-        if isinstance(decoded, StatusFrame):
-            return {
-                "phase_hint": decoded.phase_hint,
-                "battery_v": round(decoded.battery_v, 3),
-                "error_flags": decoded.error_flags,
-            }
-        if isinstance(decoded, EventFrame):
-            return {"message": decoded.message}
-        # Generic fallback
-        if hasattr(decoded, "__dict__"):
-            return {k: getattr(decoded, k) for k in vars(decoded)}
-    except Exception:
-        return {}
-    return {}
+        return FLIGHT_STATE_NAMES.get(FlightState(state), f"STATE_{state}")
+    except ValueError:
+        return f"STATE_{state}"
+
+
+def _predictor_phase(cdr_name: str) -> str:
+    """Map CDR 8-state names onto the v1 predictor's expected labels."""
+    # After PAYLOAD_SEP the vehicles descend independently — both get a
+    # landing estimate (PRD A.5.6 / Phase 8).
+    if cdr_name in ("PAYLOAD_SEP", "DESCENT", "AEROBREAK_RELEASE", "APOGEE"):
+        return "DESCENT"
+    if cdr_name in ("IMPACT", "LANDED"):
+        return "LANDED"
+    if cdr_name == "ASCENT":
+        return "ASCENT"
+    return "IDLE"
 
 
 def _empty_telemetry() -> Dict[str, Any]:
     return {
         "altitude_m": None,
+        "altitude_gnss_m": None,
+        "altitude_delta_m": None,
+        "altitude_disagreement": False,
         "speed_mps": None,
         "pitch": None,
         "yaw": None,
@@ -103,6 +114,10 @@ def _empty_telemetry() -> Dict[str, Any]:
         "temperature_c": None,
         "pressure_hpa": None,
         "battery_v": None,
+        "battery_pct": None,
+        "battery_pct_assumed": True,
+        "current_a": None,
+        "power_w": None,
         "accel_x": None,
         "accel_y": None,
         "accel_z": None,
@@ -110,6 +125,10 @@ def _empty_telemetry() -> Dict[str, Any]:
         "gyro_y": None,
         "gyro_z": None,
         "timestamp_ms": None,
+        "packet_count": None,
+        "rssi": None,
+        "snr": None,
+        "flight_software_state": None,
     }
 
 
@@ -166,14 +185,22 @@ class VehicleState:
     trail: Deque[Dict[str, float]] = field(
         default_factory=lambda: deque(maxlen=GPS_TRACK_MAX_POINTS)
     )
+    hist_traj: Deque[Dict[str, float]] = field(
+        default_factory=lambda: deque(maxlen=GPS_TRACK_MAX_POINTS)
+    )
+    origin_lat: Optional[float] = None
+    origin_lon: Optional[float] = None
 
     # Packet monitor
     recent_packets: Deque[Dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=PACKET_RING_SIZE)
     )
     frames_ok: int = 0
-    frames_crc_error: int = 0
+    frames_crc_error: int = 0  # transport malformed +RCV / oversize (not CSV)
     frames_resynced: int = 0
+    transport_ok: int = 0
+    transport_err: int = 0
+    transport_unknown: int = 0
     last_seq: Optional[int] = None
     last_seq_gap: int = 0
     total_seq_gaps: int = 0
@@ -183,10 +210,14 @@ class VehicleState:
     )
     last_packet_age_s: float = 9999.0
     last_frame_wall: float = 0.0
-    # Latest decoded frame per type (for Packet Monitor field table)
-    last_by_type: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    last_by_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    csv_stats: CsvParseStats = field(default_factory=CsvParseStats)
+    hist_rssi: Deque[float] = field(default_factory=lambda: deque(maxlen=60))
+    hist_snr: Deque[float] = field(default_factory=lambda: deque(maxlen=60))
+    last_rssi: Optional[int] = None
+    last_snr: Optional[float] = None
 
-    # Phase 7 — FSM + landing predictor (per vehicle)
+    # Predictor still used; display phase is CDR FLIGHT_SOFTWARE_STATE.
     phase_fsm: PhaseFSM = field(default_factory=PhaseFSM)
     predictor: LandingPredictor = field(
         default_factory=lambda: LandingPredictor(window=PREDICTION_WINDOW_SAMPLES)
@@ -213,6 +244,8 @@ class TelemetryHub:
         self._broadcaster_task: Optional[asyncio.Task] = None
         # Phase 10 — per-vehicle SessionLogger (or None)
         self._session_loggers: Dict[str, Any] = {v: None for v in VEHICLES}
+        # Mission-level: Rocket PAYLOAD_SEP (PRD A.5.6).
+        self._cansat_separated = False
 
     def set_session_logger(self, vehicle: str, logger: Any) -> None:
         vehicle = vehicle.lower()
@@ -281,6 +314,8 @@ class TelemetryHub:
         vehicle = vehicle.lower()
         with self._lock:
             self._states[vehicle] = VehicleState(vehicle=vehicle)
+            if vehicle == "rocket":
+                self._cansat_separated = False
             self._pending_notify[vehicle] = True
         self._schedule_notify(vehicle)
 
@@ -296,10 +331,107 @@ class TelemetryHub:
         self._schedule_notify(vehicle)
         return {"ok": True, "vehicle": vehicle, "phase": phase}
 
-    def ingest_raw_frame(
+    def _apply_parser_stats(
+        self, st: VehicleState, parser_stats: Optional[Dict[str, int]]
+    ) -> None:
+        if not parser_stats:
+            return
+        st.frames_ok = int(
+            parser_stats.get("frames_ok", parser_stats.get("transport_rcv_ok", st.frames_ok))
+        )
+        st.frames_crc_error = int(
+            parser_stats.get(
+                "frames_crc_error",
+                parser_stats.get("transport_malformed", st.frames_crc_error),
+            )
+        )
+        st.frames_resynced = int(
+            parser_stats.get("frames_resynced", st.frames_resynced)
+        )
+        if "transport_ok" in parser_stats:
+            st.transport_ok = int(parser_stats["transport_ok"])
+        if "transport_err" in parser_stats:
+            st.transport_err = int(parser_stats["transport_err"])
+        if "transport_unknown" in parser_stats:
+            st.transport_unknown = int(parser_stats["transport_unknown"])
+
+    def ingest_radio_event(
         self,
         vehicle: str,
-        frame: RawFrame,
+        item: Any,
+        parser_stats: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """Record a transport-layer +OK / +ERR / malformed line in the packet ring."""
+        if isinstance(item, RadioPacket):
+            self.ingest_radio_packet(vehicle, item, parser_stats)
+            return
+        vehicle = vehicle.lower()
+        if vehicle not in self._states:
+            return
+        wall_ms = int(time.time() * 1000)
+        with self._lock:
+            st = self._states[vehicle]
+            if parser_stats:
+                self._apply_parser_stats(st, parser_stats)
+            elif isinstance(item, ModuleErr):
+                st.transport_err += 1
+            elif isinstance(item, ModuleOk):
+                st.transport_ok += 1
+            elif isinstance(item, MalformedRadioLine):
+                if item.reason == "unknown":
+                    st.transport_unknown += 1
+                else:
+                    st.frames_crc_error += 1
+                    if item.reason == "oversize":
+                        st.frames_resynced += 1
+
+            raw = getattr(item, "raw_line", "") or ""
+            if isinstance(item, ModuleOk):
+                type_name = "+OK"
+                ok = True
+                error = None
+                fields: Dict[str, Any] = {"response": "+OK"}
+            elif isinstance(item, ModuleErr):
+                type_name = "+ERR"
+                ok = False
+                error = f"+ERR={item.code}"
+                fields = {"code": item.code}
+            elif isinstance(item, MalformedRadioLine):
+                type_name = "MALFORMED"
+                ok = False
+                error = f"transport {item.reason}"
+                fields = {"reason": item.reason}
+            else:
+                type_name = type(item).__name__
+                ok = False
+                error = "unknown radio event"
+                fields = {}
+
+            pkt_rec = {
+                "t": wall_ms,
+                "seq": None,
+                "type": type_name,
+                "type_name": type_name,
+                "layer": "transport",
+                "address": None,
+                "rssi": None,
+                "snr": None,
+                "len": len(raw),
+                "csv": None,
+                "ascii": raw,
+                "hex": raw.encode("utf-8", errors="replace").hex(" "),
+                "ok": ok,
+                "error": error,
+                "fields": fields,
+            }
+            st.recent_packets.appendleft(pkt_rec)
+            self._pending_notify[vehicle] = True
+        self._schedule_notify(vehicle)
+
+    def ingest_radio_packet(
+        self,
+        vehicle: str,
+        packet: RadioPacket,
         parser_stats: Optional[Dict[str, int]] = None,
         logging_enabled: bool = True,
     ) -> None:
@@ -312,76 +444,71 @@ class TelemetryHub:
 
         with self._lock:
             st = self._states[vehicle]
-            if parser_stats:
-                st.frames_ok = int(parser_stats.get("frames_ok", st.frames_ok))
-                st.frames_crc_error = int(
-                    parser_stats.get("frames_crc_error", st.frames_crc_error)
-                )
-                st.frames_resynced = int(
-                    parser_stats.get("frames_resynced", st.frames_resynced)
-                )
+            self._apply_parser_stats(st, parser_stats)
 
-            # Seq gap detection
-            if st.last_seq is not None:
-                expected = (st.last_seq + 1) & 0xFF
-                if frame.seq != expected:
-                    gap = (frame.seq - expected) & 0xFF
-                    st.last_seq_gap = gap
-                    st.total_seq_gaps += 1
+            fc_before = st.csv_stats.field_count_error
+            ty_before = st.csv_stats.type_error
+            rec = parse_telemetry_csv(packet.data, st.csv_stats)
+            decode_err = None
+            if rec is None:
+                if st.csv_stats.field_count_error > fc_before:
+                    decode_err = "csv field count"
+                elif st.csv_stats.type_error > ty_before:
+                    decode_err = "csv type error"
                 else:
-                    st.last_seq_gap = 0
-            st.last_seq = frame.seq
+                    decode_err = "csv parse failed"
+
+            seq = rec.packet_count if rec is not None else st.last_seq
+            if rec is not None:
+                if st.last_seq is not None:
+                    expected = st.last_seq + 1
+                    if rec.packet_count != expected:
+                        st.last_seq_gap = rec.packet_count - expected
+                        st.total_seq_gaps += 1
+                    else:
+                        st.last_seq_gap = 0
+                st.last_seq = rec.packet_count
+
             st.packet_times.append(now)
             st.last_frame_wall = now
             st.last_packet_age_s = 0.0
             st.link_state = "CONNECTED"
+            st.last_rssi = int(packet.rssi)
+            st.last_snr = float(packet.snr)
+            st.hist_rssi.append(float(packet.rssi))
+            st.hist_snr.append(float(packet.snr))
             rate = self._packet_rate_hz(st)
             st.packet_rate_history.append(round(rate, 2))
 
             if not st._got_first_frame:
                 st._got_first_frame = True
                 st.prev_phase = st.phase
-                st.phase_fsm.on_connected()
-                st.phase = st.phase_fsm.phase
 
-            # Decode payload defensively
-            decoded = None
-            decode_err = None
-            try:
-                decoded = decode_payload(frame.packet_type, frame.payload)
-            except ProtocolError as exc:
-                decode_err = str(exc)
-            except Exception as exc:
-                decode_err = str(exc)
-
-            fields = _fields_from_decoded(decoded) if decoded is not None else {}
-            type_name = _PACKET_TYPE_NAMES.get(
-                frame.packet_type, f"0x{frame.packet_type:02X}"
-            )
+            fields = _fields_from_record(rec)
+            raw = packet.raw_line or packet.data
             pkt_rec = {
                 "t": wall_ms,
-                "seq": frame.seq,
-                "type": frame.packet_type,
-                "type_name": type_name,
-                "vehicle_id": frame.vehicle_id,
-                "len": len(frame.payload),
-                "hex": frame.raw_bytes.hex(" "),
-                "payload_hex": frame.payload.hex(" "),
-                "ok": decode_err is None,
+                "seq": seq,
+                "type": "TELEMETRY",
+                "type_name": "TELEMETRY",
+                "layer": "application",
+                "address": packet.address,
+                "rssi": packet.rssi,
+                "snr": packet.snr,
+                "len": len(packet.data),
+                "csv": packet.data,
+                "ascii": raw,
+                "hex": raw.encode("utf-8", errors="replace").hex(" "),
+                "ok": rec is not None,
                 "error": decode_err,
                 "fields": fields,
             }
             st.recent_packets.appendleft(pkt_rec)
-            if decoded is not None:
-                st.last_by_type[frame.packet_type] = pkt_rec
+            if rec is not None:
+                st.last_by_type["TELEMETRY"] = pkt_rec
+                self._apply_record(st, rec, packet, now)
+            self._pending_notify[vehicle] = True
 
-            if decoded is None:
-                self._pending_notify[vehicle] = True
-            else:
-                self._apply_decoded(st, frame.packet_type, decoded, now)
-                self._pending_notify[vehicle] = True
-
-            # Continuous CSV log (Phase 10) — after phase/prediction update
             if logging_enabled:
                 logger = self._session_loggers.get(vehicle)
                 if logger is not None:
@@ -390,107 +517,140 @@ class TelemetryHub:
 
                         logger.log_row(
                             build_log_row_from_state(
-                                vehicle, frame, st, wall_ms, type_name=type_name
+                                vehicle, packet, st, wall_ms, type_name="TELEMETRY"
                             )
                         )
                     except Exception:
                         pass
 
         self._schedule_notify(vehicle)
+        if vehicle == "rocket":
+            with self._lock:
+                sat_pending = bool(self._pending_notify.get("satellite"))
+            if sat_pending:
+                self._schedule_notify("satellite")
 
-    def _apply_decoded(
-        self, st: VehicleState, packet_type: int, decoded: Any, now: float
+    def _apply_record(
+        self,
+        st: VehicleState,
+        rec: TelemetryRecord,
+        packet: RadioPacket,
+        now: float,
     ) -> None:
-        event_for_fsm: Optional[str] = None
+        speed = self._estimate_vspeed(st, float(rec.altitude_m), now)
+        delta = abs(float(rec.altitude_m) - float(rec.gnss_alt_m))
+        disagree = delta > ALTITUDE_DISAGREEMENT_THRESHOLD_M
+        st.telemetry = {
+            "altitude_m": float(rec.altitude_m),
+            "altitude_gnss_m": float(rec.gnss_alt_m),
+            "altitude_delta_m": round(delta, 2),
+            "altitude_disagreement": disagree,
+            "speed_mps": speed,
+            "pitch": None,
+            "yaw": None,
+            "roll": None,
+            "temperature_c": float(rec.temp_c),
+            "pressure_hpa": float(rec.pressure),
+            "battery_v": float(rec.voltage),
+            # TEMPORARY/UNCONFIRMED 2S Li-ion curve (Appendix 1.4).
+            "battery_pct": round(voltage_to_percent(float(rec.voltage)), 1),
+            "battery_pct_assumed": True,
+            # INA219 current is not in the 19-field CSV yet.
+            "current_a": None,
+            "power_w": None,
+            "accel_x": float(rec.accel_x),
+            "accel_y": float(rec.accel_y),
+            "accel_z": float(rec.accel_z),
+            "gyro_x": float(rec.gyro_x),
+            "gyro_y": float(rec.gyro_y),
+            "gyro_z": float(rec.gyro_z),
+            "timestamp_ms": None,
+            "packet_count": int(rec.packet_count),
+            "rssi": int(packet.rssi),
+            "snr": float(packet.snr),
+            "flight_software_state": int(rec.flight_software_state),
+        }
+        st.hist_t.append(now)
+        st.hist_altitude.append(float(rec.altitude_m))
+        st.hist_speed.append(speed if speed is not None else 0.0)
+        st.hist_battery.append(float(rec.voltage))
+        st.hist_temperature.append(float(rec.temp_c))
+        st.hist_pressure.append(float(rec.pressure))
+        st._last_alt = float(rec.altitude_m)
+        st._last_alt_t = now
 
-        if packet_type == TYPE_TELEMETRY:
-            t = decoded
-            speed = self._estimate_vspeed(st, float(t.altitude_m), now)
-            st.telemetry = {
-                "altitude_m": float(t.altitude_m),
-                "speed_mps": speed,
-                "pitch": float(t.pitch),
-                "yaw": float(t.yaw),
-                "roll": float(t.roll),
-                "temperature_c": float(t.temperature_c),
-                "pressure_hpa": float(t.pressure_hpa),
-                "battery_v": float(t.battery_v),
-                "accel_x": float(t.accel_x),
-                "accel_y": float(t.accel_y),
-                "accel_z": float(t.accel_z),
-                "gyro_x": float(t.gyro_x),
-                "gyro_y": float(t.gyro_y),
-                "gyro_z": float(t.gyro_z),
-                "timestamp_ms": int(t.timestamp_ms),
-            }
-            st.hist_t.append(now)
-            st.hist_altitude.append(float(t.altitude_m))
-            st.hist_speed.append(speed if speed is not None else 0.0)
-            st.hist_pitch.append(float(t.pitch))
-            st.hist_yaw.append(float(t.yaw))
-            st.hist_roll.append(float(t.roll))
-            st.hist_battery.append(float(t.battery_v))
-            st.hist_temperature.append(float(t.temperature_c))
-            st.hist_pressure.append(float(t.pressure_hpa))
-            st._last_alt = float(t.altitude_m)
-            st._last_alt_t = now
-
-            # Feed altitude into predictor between GPS fixes
+        st.gps = {
+            "lat": float(rec.gnss_lat),
+            "lon": float(rec.gnss_lon),
+            "alt_m": float(rec.gnss_alt_m),
+            "sats": int(rec.gnss_sats),
+            "hdop": None,
+            "fix_type": 2 if rec.gnss_sats else 0,
+            "gps_timestamp": rec.gnss_time,
+        }
+        if rec.gnss_sats > 0:
+            st.trail.append(
+                {"lat": float(rec.gnss_lat), "lon": float(rec.gnss_lon), "t": now}
+            )
+            if st.origin_lat is None:
+                st.origin_lat = float(rec.gnss_lat)
+                st.origin_lon = float(rec.gnss_lon)
+            range_m = haversine_m(
+                st.origin_lat,
+                st.origin_lon,
+                float(rec.gnss_lat),
+                float(rec.gnss_lon),
+            )
+            st.hist_traj.append(
+                {
+                    "range_m": round(range_m, 2),
+                    "alt_m": float(rec.altitude_m),
+                    "t": now,
+                }
+            )
             try:
-                st.predictor.push_altitude(now, float(t.altitude_m))
+                st.predictor.push_gps(
+                    now,
+                    float(rec.gnss_lat),
+                    float(rec.gnss_lon),
+                    float(rec.altitude_m),
+                    hdop=1.0,
+                )
             except Exception:
                 pass
 
-            event_for_fsm = st._pending_event
-            st._pending_event = None
-            self._run_phase_and_prediction(st, now, event=event_for_fsm)
+        try:
+            st.predictor.push_altitude(now, float(rec.altitude_m))
+        except Exception:
+            pass
 
-        elif packet_type == TYPE_GPS:
-            g = decoded
-            st.gps = {
-                "lat": float(g.lat),
-                "lon": float(g.lon),
-                "alt_m": float(g.alt_msl_m),
-                "sats": int(g.num_sats),
-                "hdop": float(g.hdop),
-                "fix_type": int(g.fix_type),
-                "gps_timestamp": int(g.gps_timestamp),
-            }
-            if g.fix_type > 0:
-                st.trail.append(
-                    {"lat": float(g.lat), "lon": float(g.lon), "t": now}
-                )
-                # Prefer AGL from last telemetry for vertical fit
-                alt_for_pred = (
-                    float(st.telemetry["altitude_m"])
-                    if st.telemetry.get("altitude_m") is not None
-                    else float(g.alt_msl_m)
-                )
-                try:
-                    st.predictor.push_gps(
-                        now,
-                        float(g.lat),
-                        float(g.lon),
-                        alt_for_pred,
-                        hdop=float(g.hdop),
-                    )
-                except Exception:
-                    pass
-            # Recompute prediction on GPS (descent tracking)
-            self._update_prediction_only(st)
+        cdr_name = _cdr_phase_name(int(rec.flight_software_state))
+        st.prev_phase = st.phase
+        st.phase = cdr_name
+        if (
+            st.vehicle == "rocket"
+            and st.prev_phase != cdr_name
+            and cdr_name == "PAYLOAD_SEP"
+        ):
+            self._cansat_separated = True
+            st.events.appendleft("CanSat Separated")
+            self._states["satellite"].events.appendleft("CanSat Separated")
+            self._pending_notify["satellite"] = True
 
-        elif packet_type == TYPE_STATUS:
-            s = decoded
-            st.telemetry["battery_v"] = float(s.battery_v)
-            # phase_hint 0 = let ground station decide (PRD)
-
-        elif packet_type == TYPE_EVENT:
-            msg = str(decoded.message)
-            st.events.appendleft(msg)
-            # Apply on next telemetry sample so we have altitude context;
-            # also step immediately with last known kinematics.
-            st._pending_event = msg
-            self._run_phase_and_prediction(st, now, event=msg)
+        pred_phase = _predictor_phase(cdr_name)
+        try:
+            result = st.predictor.compute(
+                phase=pred_phase,
+                current_lat=st.gps.get("lat"),
+                current_lon=st.gps.get("lon"),
+                current_alt_m=st.telemetry.get("altitude_m"),
+                current_hdop=st.gps.get("hdop"),
+            )
+            st.prediction = result.as_dict() if result is not None else (
+                st.prediction if pred_phase == "LANDED" else None
+            )
+        except Exception:
+            pass
 
     def _run_phase_and_prediction(
         self,
@@ -601,6 +761,49 @@ class TelemetryHub:
                 full_history=full_history,
             )
 
+    def _trajectory_payload(
+        self, st: VehicleState, *, full_history: bool
+    ) -> Dict[str, Any]:
+        path = list(st.hist_traj)
+        last = path[-1] if path else None
+        hspeed = None
+        if len(path) >= 2:
+            dt = float(path[-1]["t"]) - float(path[-2]["t"])
+            if dt > 1e-3:
+                hspeed = (
+                    float(path[-1]["range_m"]) - float(path[-2]["range_m"])
+                ) / dt
+        climb, src = climb_angle_deg(
+            st.telemetry.get("pitch"),
+            st.telemetry.get("speed_mps"),
+            hspeed,
+        )
+        trend_active = st.phase == "ASCENT"
+        trend = ascent_trend(path) if trend_active else []
+        blob: Dict[str, Any] = {
+            "origin": (
+                {"lat": st.origin_lat, "lon": st.origin_lon}
+                if st.origin_lat is not None and st.origin_lon is not None
+                else None
+            ),
+            "range_m": last["range_m"] if last else None,
+            "climb_deg": round(float(climb), 1) if climb is not None else None,
+            "climb_source": src,
+            "trend_active": trend_active,
+            "trend": trend,
+        }
+        if full_history:
+            blob["path"] = [
+                {"range_m": p["range_m"], "alt_m": p["alt_m"]} for p in path[-300:]
+            ]
+        else:
+            blob["path_point"] = (
+                [{"range_m": last["range_m"], "alt_m": last["alt_m"]}]
+                if last
+                else []
+            )
+        return blob
+
     def _snapshot_unlocked(
         self,
         st: VehicleState,
@@ -629,22 +832,17 @@ class TelemetryHub:
                 "last_packet_age_s": round(age, 3),
             },
             "prediction": st.prediction,
+            "trajectory": self._trajectory_payload(st, full_history=full_history),
             "prev_phase": st.prev_phase,
             "events": list(st.events)[:5],
-            "packets": {
-                "frames_ok": st.frames_ok,
-                "frames_crc_error": st.frames_crc_error,
-                "frames_resynced": st.frames_resynced,
-                "packet_rate_hz": round(self._packet_rate_hz(st), 2),
-                "last_seq": st.last_seq,
-                "last_seq_gap": st.last_seq_gap,
-                "total_seq_gaps": st.total_seq_gaps,
-                "rate_history": list(st.packet_rate_history)[-40:],
-                "recent": list(st.recent_packets)[:pkt_n],
-                "last_by_type": {
-                    str(k): v for k, v in st.last_by_type.items()
-                },
+            "cansat_separated": self._cansat_separated,
+            "signal": {
+                "rssi": st.last_rssi,
+                "snr": st.last_snr,
+                "rssi_history": list(st.hist_rssi)[-40:],
+                "snr_history": list(st.hist_snr)[-40:],
             },
+            "packets": self._packets_counters(st, recent_n=pkt_n),
         }
         if full_history:
             msg["history"] = {
@@ -661,7 +859,7 @@ class TelemetryHub:
         else:
             # Lightweight live update — client appends to its own history
             msg["trail_point"] = list(st.trail)[-1:] if st.trail else []
-        return msg
+        return json_safe(msg)
 
     def connection_summary(self) -> Dict[str, Any]:
         with self._lock:
@@ -674,6 +872,36 @@ class TelemetryHub:
                 for v in VEHICLES
             }
 
+    def _packets_counters(
+        self, st: VehicleState, recent_n: Optional[int] = None
+    ) -> Dict[str, Any]:
+        now = time.monotonic()
+        age = (now - st.last_frame_wall) if st.last_frame_wall else 9999.0
+        blob: Dict[str, Any] = {
+            "frames_ok": st.frames_ok,
+            "frames_crc_error": st.frames_crc_error,
+            "frames_resynced": st.frames_resynced,
+            "transport_malformed": st.frames_crc_error,
+            "transport_ok": st.transport_ok,
+            "transport_err": st.transport_err,
+            "transport_unknown": st.transport_unknown,
+            "app_parse_error": st.csv_stats.errors,
+            "app_field_count_error": st.csv_stats.field_count_error,
+            "app_type_error": st.csv_stats.type_error,
+            "rssi": st.last_rssi,
+            "snr": st.last_snr,
+            "packet_rate_hz": round(self._packet_rate_hz(st), 2),
+            "last_seq": st.last_seq,
+            "last_seq_gap": st.last_seq_gap,
+            "total_seq_gaps": st.total_seq_gaps,
+            "last_packet_age_s": round(age, 3),
+            "rate_history": list(st.packet_rate_history)[-40:],
+            "last_by_type": {str(k): v for k, v in st.last_by_type.items()},
+        }
+        if recent_n is not None:
+            blob["recent"] = list(st.recent_packets)[:recent_n]
+        return blob
+
     def packets_snapshot(self, vehicle: str, limit: int = 50) -> Dict[str, Any]:
         """Full packet monitor payload for GET /packets/{vehicle} (PRD C.5)."""
         vehicle = vehicle.lower()
@@ -681,20 +909,8 @@ class TelemetryHub:
             raise KeyError(vehicle)
         with self._lock:
             st = self._states[vehicle]
-            now = time.monotonic()
-            age = (now - st.last_frame_wall) if st.last_frame_wall else 9999.0
             lim = max(1, min(int(limit), PACKET_RING_SIZE))
-            return {
-                "vehicle": vehicle,
-                "frames_ok": st.frames_ok,
-                "frames_crc_error": st.frames_crc_error,
-                "frames_resynced": st.frames_resynced,
-                "packet_rate_hz": round(self._packet_rate_hz(st), 2),
-                "last_seq": st.last_seq,
-                "last_seq_gap": st.last_seq_gap,
-                "total_seq_gaps": st.total_seq_gaps,
-                "last_packet_age_s": round(age, 3),
-                "rate_history": list(st.packet_rate_history),
-                "recent": list(st.recent_packets)[:lim],
-                "last_by_type": {str(k): v for k, v in st.last_by_type.items()},
-            }
+            blob = self._packets_counters(st, recent_n=lim)
+            blob["vehicle"] = vehicle
+            blob["rate_history"] = list(st.packet_rate_history)
+            return json_safe(blob)

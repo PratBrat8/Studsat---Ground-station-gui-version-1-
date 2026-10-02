@@ -1,6 +1,6 @@
-# STUDSAT Ground Station — full Windows package (Phase 12).
+# STUDSAT Ground Station — full Windows package (Phase 14 / PRD v2 D.14).
 # Prerequisites: Python 3.10+, Node.js 18+, npm
-# Output: electron/dist/*.exe installer (NSIS)
+# Output: electron/dist/*.exe installer (NSIS) — Setup-2.0.0.exe
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot

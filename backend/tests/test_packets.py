@@ -13,8 +13,8 @@ if str(_BACKEND) not in sys.path:
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.frame_parser import FrameParser
-from app.protocol import VEHICLE_ROCKET, TelemetryFrame, encode_packet
+from app.protocol import FlightState, TelemetryRecord, format_telemetry_csv
+from app.radio_transport import format_rcv_line, parse_rcv_line
 from app.telemetry_hub import TelemetryHub
 
 
@@ -33,6 +33,9 @@ def test_packets_endpoint_empty(client: TestClient):
     assert body["recent"] == []
     assert "frames_crc_error" in body
     assert "frames_resynced" in body
+    assert "transport_malformed" in body
+    assert "app_parse_error" in body
+    assert "rssi" in body
 
 
 def test_packets_endpoint_bad_vehicle(client: TestClient):
@@ -41,51 +44,46 @@ def test_packets_endpoint_bad_vehicle(client: TestClient):
 
 def test_hub_packet_record_has_hex_and_fields():
     hub = TelemetryHub()
-    parser = FrameParser()
-    wire = encode_packet(
-        VEHICLE_ROCKET,
-        3,
-        TelemetryFrame(
-            timestamp_ms=42,
-            altitude_m=100.5,
-            pressure_hpa=980.0,
-            temperature_c=21.0,
-            accel_x=0.0,
-            accel_y=0.0,
-            accel_z=9.8,
-            gyro_x=0.0,
-            gyro_y=0.0,
-            gyro_z=0.0,
-            pitch=1.5,
-            yaw=90.0,
-            roll=-2.0,
-            battery_v=7.6,
-        ),
+    rec_in = TelemetryRecord(
+        team_id="XXXX",
+        timestamp="00:00:01",
+        packet_count=3,
+        altitude_m=100.5,
+        pressure=980.0,
+        temp_c=21.0,
+        voltage=7.6,
+        gnss_time="00:00:01",
+        gnss_lat=12.97,
+        gnss_lon=77.59,
+        gnss_alt_m=932.5,
+        gnss_sats=8,
+        accel_x=0.0,
+        accel_y=0.0,
+        accel_z=9.8,
+        gyro_x=0.0,
+        gyro_y=0.0,
+        gyro_z=0.0,
+        flight_software_state=int(FlightState.LAUNCH_PAD),
     )
-    frames = parser.feed(wire)
-    assert len(frames) == 1
-    hub.ingest_raw_frame(
+    pkt = parse_rcv_line(format_rcv_line(1, format_telemetry_csv(rec_in), -70, 8.0))
+    assert pkt is not None
+    hub.ingest_radio_packet(
         "rocket",
-        frames[0],
-        {
-            "frames_ok": parser.frames_ok,
-            "frames_crc_error": 0,
-            "frames_resynced": 0,
-        },
+        pkt,
+        {"frames_ok": 1, "frames_crc_error": 0, "frames_resynced": 0},
     )
     snap = hub.packets_snapshot("rocket")
     assert snap["frames_ok"] >= 1
     assert len(snap["recent"]) >= 1
     rec = snap["recent"][0]
     assert "hex" in rec and len(rec["hex"]) > 10
-    assert rec["hex"].lower().startswith("aa 55")
+    assert rec["layer"] == "application"
     assert rec["type_name"] == "TELEMETRY"
     assert rec["ok"] is True
+    assert rec["rssi"] == -70
     assert rec["fields"]["altitude_m"] == pytest.approx(100.5, rel=1e-3)
-    assert rec["fields"]["battery_v"] == pytest.approx(7.6, rel=1e-3)
-    assert "1" in snap["last_by_type"] or 1 in [
-        int(k) for k in snap["last_by_type"].keys()
-    ]
+    assert rec["fields"]["voltage"] == pytest.approx(7.6, rel=1e-3)
+    assert "TELEMETRY" in snap["last_by_type"]
 
 
 def test_packets_via_http_after_sim(client: TestClient):

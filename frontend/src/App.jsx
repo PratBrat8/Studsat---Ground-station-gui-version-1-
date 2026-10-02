@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import TopBar from './components/shell/TopBar.jsx';
 import RocketTab from './components/shell/RocketTab.jsx';
 import SatelliteTab from './components/shell/SatelliteTab.jsx';
@@ -6,6 +6,7 @@ import ReplayTab from './components/shell/ReplayTab.jsx';
 import SettingsTab from './components/shell/SettingsTab.jsx';
 import AppErrorBoundary from './components/shell/AppErrorBoundary.jsx';
 import { fetchHealth } from './services/api.js';
+import { onBackendRecovered } from './services/vehicleBridge.js';
 
 const TABS = ['rocket', 'satellite', 'replay', 'settings'];
 
@@ -17,6 +18,7 @@ export default function App() {
     error: null,
   });
   const [toast, setToast] = useState(null);
+  const healthStateRef = useRef('checking');
 
   useEffect(() => {
     let cancelled = false;
@@ -26,14 +28,20 @@ export default function App() {
       try {
         const data = await fetchHealth();
         if (!cancelled) {
+          const wasDown = healthStateRef.current === 'err';
+          healthStateRef.current = 'ok';
           setBackendStatus({
             state: 'ok',
             version: data.version ?? 'unknown',
             error: null,
           });
+          if (wasDown) {
+            onBackendRecovered().catch(() => {});
+          }
         }
       } catch (err) {
         if (!cancelled) {
+          healthStateRef.current = 'err';
           setBackendStatus({
             state: 'err',
             version: null,
@@ -51,7 +59,7 @@ export default function App() {
     };
   }, []);
 
-  // Electron backend crash/recovery toasts (Phase 11)
+  // Electron backend crash/recovery toasts (Phase 13)
   useEffect(() => {
     const unsub = window.studsat?.onBackendStatus?.((payload) => {
       if (!payload) return;
@@ -60,8 +68,11 @@ export default function App() {
         text: payload.message || payload.state,
       });
       if (payload.state === 'ok') {
+        healthStateRef.current = 'ok';
         setBackendStatus((s) => ({ ...s, state: 'ok', error: null }));
+        onBackendRecovered().catch(() => {});
       } else if (payload.state === 'err') {
+        healthStateRef.current = 'err';
         setBackendStatus((s) => ({
           ...s,
           state: 'err',

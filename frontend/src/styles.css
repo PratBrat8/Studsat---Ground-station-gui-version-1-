@@ -295,6 +295,11 @@ button:disabled {
   border-color: rgba(227, 93, 106, 0.4);
 }
 
+.link-pill.warn {
+  color: #f0c14d;
+  border-color: rgba(240, 193, 77, 0.45);
+}
+
 .link-pill.mode {
   color: var(--accent);
   border-color: rgba(61, 156, 240, 0.35);
@@ -988,6 +993,12 @@ button:disabled {
   display: flex;
   gap: 0.35rem;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+.map-badges .btn {
+  font-size: 0.75rem;
+  padding: 0.28rem 0.6rem;
 }
 
 .map-canvas-wrap {
@@ -1199,6 +1210,23 @@ button:disabled {
   color: var(--muted);
 }
 
+.conf-pill.conf-primary {
+  color: var(--ok);
+  border-color: rgba(125, 255, 179, 0.55);
+  background: rgba(125, 255, 179, 0.12);
+}
+
+.prediction-pills {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.prediction-card.primary {
+  border-color: rgba(125, 255, 179, 0.45);
+  box-shadow: 0 0 0 1px rgba(125, 255, 179, 0.15);
+}
+
 .prediction-actions {
   margin-top: 0.75rem;
   padding-top: 0.65rem;
@@ -1267,7 +1295,7 @@ button:disabled {
 
 .packet-list-item {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: minmax(0, 1.2fr) auto auto auto;
   gap: 0.35rem;
   width: 100%;
   text-align: left;
@@ -1300,8 +1328,13 @@ button:disabled {
 }
 
 .pkt-seq,
-.pkt-len {
+.pkt-len,
+.pkt-rssi {
   color: var(--muted);
+}
+
+.packet-list-item.transport .pkt-type {
+  color: #f0c14d;
 }
 
 .pkt-flag {
@@ -1834,5 +1867,326 @@ button:disabled {
   margin: 0.55rem 0.75rem !important;
   font-size: 0.82rem !important;
   line-height: 1.4;
+}
+
+/* —— Command console (PRD v2 Phase 11) —— */
+.command-console {
+  margin: 1rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.command-group {
+  margin-bottom: 0.7rem;
+}
+
+.command-console-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: baseline;
+  margin-bottom: 0.65rem;
+}
+
+.command-console-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.command-row,
+.command-ej {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  margin-bottom: 0.55rem;
+}
+
+.command-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  font-size: 0.82rem;
+  margin: 0.4rem 0;
+}
+
+.command-time-input {
+  width: 7.5rem;
+  font-variant-numeric: tabular-nums;
+  font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace;
+  background: #0e141c;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+}
+
+.hold-confirm {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  touch-action: none;
+  user-select: none;
+}
+
+.hold-confirm-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left center;
+  transform: scaleX(0);
+  background: rgba(255, 255, 255, 0.22);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hold-confirm.danger .hold-confirm-fill,
+.btn.danger.hold-confirm .hold-confirm-fill {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.hold-confirm-label {
+  position: relative;
+  z-index: 1;
+}
+
+.command-ej-note {
+  margin: 0.25rem 0 0;
+  max-width: 42rem;
+}
+
+.command-log {
+  margin-top: 0.55rem;
+}
+
+.command-log-table-wrap {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0a1018;
+}
+
+.command-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.command-log-table th,
+.command-log-table td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.command-log-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  position: sticky;
+  top: 0;
+  background: #0e141c;
+}
+
+.command-log-table code {
+  color: var(--text);
+  font-size: 0.76rem;
+}
+
+/* —— Phase 5 status cards —— */
+.status-cards-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin: 0.85rem 0 1rem;
+}
+
+.status-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 0.8rem 0.9rem;
+}
+
+.status-card.warn {
+  border-color: rgba(240, 193, 77, 0.55);
+  box-shadow: 0 0 0 1px rgba(240, 193, 77, 0.2);
+}
+
+.status-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.status-card-head h2 {
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.dual-alt-grid,
+.batt-grid,
+.signal-nums {
+  display: grid;
+  gap: 0.55rem 0.8rem;
+}
+
+.dual-alt-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.batt-grid.rocket {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.batt-grid.cansat {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.signal-nums {
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 0.4rem;
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
+.battery-icon {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.sparkline {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+.sparkline.empty {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+}
+
+@media (max-width: 720px) {
+  .status-cards-row,
+  .dual-alt-grid,
+  .batt-grid.rocket,
+  .batt-grid.cansat,
+  .signal-nums {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* —— Phase 8: trajectory —— */
+.trajectory-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 0.75rem 0.9rem 0.85rem;
+  margin: 0 0 1.25rem;
+}
+
+.trajectory-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+  margin-bottom: 0.45rem;
+}
+
+.trajectory-readouts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(80px, 1fr));
+  gap: 0.6rem 1rem;
+}
+
+.trajectory-chart {
+  height: 220px;
+}
+
+.trajectory-note {
+  margin: 0.45rem 0 0;
+}
+
+/* —— Phase 9: CDR strip + separation banner —— */
+.cdr-strip {
+  margin: 0.35rem 0 0.75rem;
+  overflow-x: auto;
+}
+
+.cdr-strip-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(4.2rem, 1fr));
+  gap: 0.35rem;
+}
+
+.cdr-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.35rem 0.2rem 0.4rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-align: center;
+}
+
+.cdr-step-n {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.cdr-step.done {
+  color: var(--text);
+  border-color: rgba(61, 156, 240, 0.35);
+}
+
+.cdr-step.current {
+  color: var(--ok);
+  border-color: rgba(125, 255, 179, 0.55);
+  background: rgba(125, 255, 179, 0.08);
+  box-shadow: 0 0 0 1px rgba(125, 255, 179, 0.2);
+  font-weight: 700;
+}
+
+.cdr-step.current .cdr-step-label {
+  color: var(--ok);
+}
+
+.banner.sep-banner {
+  background: rgba(240, 193, 77, 0.12);
+  border: 1px solid rgba(240, 193, 77, 0.5);
+  color: #ffe7a8;
+  font-size: 0.95rem;
+}
+
+.sep-banner-body {
+  color: inherit;
+  opacity: 0.92;
+}
+
+@media (max-width: 720px) {
+  .cdr-strip-list {
+    grid-template-columns: repeat(4, minmax(4rem, 1fr));
+  }
 }
 

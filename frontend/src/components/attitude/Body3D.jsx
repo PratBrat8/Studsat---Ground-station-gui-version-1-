@@ -1,7 +1,14 @@
-import React, { Suspense, useMemo, useRef } from 'react';
+import React, { Component, Suspense, useMemo, useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
+import { OrbitControls, useGLTF } from '@react-three/drei';
+import * as THREE from 'three';
 import { useVehicleStore } from '../../state/vehicleStore.js';
 import { wrap360 } from '../../utils/format.js';
+
+const CAD_URL = {
+  rocket: `${import.meta.env.BASE_URL}models/rocket.glb`,
+  satellite: `${import.meta.env.BASE_URL}models/cansat.glb`,
+};
 
 function lerp(a, b, t) {
   return a + (b - a) * t;
@@ -27,7 +34,6 @@ function RocketMesh() {
         <cylinderGeometry args={[0.18, 0.28, 0.2, 12]} />
         <meshStandardMaterial color="#3d4a5c" metalness={0.2} roughness={0.7} />
       </mesh>
-      {/* Fins */}
       {[0, 90, 180, 270].map((a) => (
         <mesh
           key={a}
@@ -42,7 +48,6 @@ function RocketMesh() {
           <meshStandardMaterial color="#3d9cf0" metalness={0.3} roughness={0.5} />
         </mesh>
       ))}
-      {/* Axis helper nose tint */}
       <mesh position={[0, 0.85, 0]}>
         <sphereGeometry args={[0.05, 8, 8]} />
         <meshStandardMaterial color="#7dffb3" emissive="#1a5c3a" />
@@ -59,7 +64,6 @@ function SatelliteMesh() {
         <boxGeometry args={[0.55, 0.55, 0.55]} />
         <meshStandardMaterial color="#c5cdd8" metalness={0.5} roughness={0.35} />
       </mesh>
-      {/* Solar panels */}
       <mesh position={[-0.7, 0, 0]}>
         <boxGeometry args={[0.7, 0.08, 0.45]} />
         <meshStandardMaterial color="#1e4d8c" metalness={0.6} roughness={0.25} />
@@ -68,13 +72,68 @@ function SatelliteMesh() {
         <boxGeometry args={[0.7, 0.08, 0.45]} />
         <meshStandardMaterial color="#1e4d8c" metalness={0.6} roughness={0.25} />
       </mesh>
-      {/* Antenna */}
       <mesh position={[0, 0.45, 0]}>
         <cylinderGeometry args={[0.02, 0.02, 0.35, 8]} />
         <meshStandardMaterial color="#3dd6a5" />
       </mesh>
     </group>
   );
+}
+
+function fitCadScene(scene, targetSize = 1.65) {
+  const root = scene.clone(true);
+  root.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(root);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  root.scale.multiplyScalar(targetSize / maxDim);
+  root.updateMatrixWorld(true);
+  box.setFromObject(root);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  root.position.sub(center);
+  root.traverse((obj) => {
+    if (obj.isMesh) {
+      obj.castShadow = false;
+      obj.receiveShadow = false;
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      mats.forEach((mat) => {
+        if (!mat) return;
+        mat.side = THREE.DoubleSide;
+        if ('metalness' in mat) mat.metalness = Math.min(0.45, mat.metalness ?? 0.3);
+        if ('roughness' in mat) mat.roughness = Math.max(0.35, mat.roughness ?? 0.5);
+      });
+    }
+  });
+  return root;
+}
+
+/** Team CAD (PRD A.5.9). Converter baked longest axis to +Y. */
+function CadMesh({ url }) {
+  const gltf = useGLTF(url);
+  const scene = useMemo(() => fitCadScene(gltf.scene), [gltf.scene]);
+  return <primitive object={scene} />;
+}
+
+class CadFallbackBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(err) {
+    console.warn('[Body3D] CAD GLB failed, using procedural mesh', err);
+  }
+
+  render() {
+    if (this.state.failed) return this.props.fallback;
+    return this.props.children;
+  }
 }
 
 /**
@@ -87,8 +146,6 @@ function AttitudeBody({ vehicle, vehicleKind }) {
   const smooth = useRef({ pitch: 0, yaw: 0, roll: 0 });
 
   const useStore = useVehicleStore(vehicle);
-  // Subscribe outside useFrame via zustand — values update React render
-  // and we copy into target ref for the rAF loop.
   const pitch = useStore((s) => s.telemetry.pitch) ?? 0;
   const yaw = useStore((s) => s.telemetry.yaw) ?? 0;
   const roll = useStore((s) => s.telemetry.roll) ?? 0;
@@ -101,7 +158,6 @@ function AttitudeBody({ vehicle, vehicleKind }) {
     const s = smooth.current;
     const t = target.current;
 
-    // Shortest-path yaw lerp
     let dy = t.yaw - s.yaw;
     if (dy > 180) dy -= 360;
     if (dy < -180) dy += 360;
@@ -116,28 +172,33 @@ function AttitudeBody({ vehicle, vehicleKind }) {
     group.current.rotation.z = degToRad(-s.roll);
   });
 
-  const mesh = useMemo(
-    () => (vehicleKind === 'satellite' ? <SatelliteMesh /> : <RocketMesh />),
-    [vehicleKind]
-  );
+  const procedural =
+    vehicleKind === 'satellite' ? <SatelliteMesh /> : <RocketMesh />;
+  const url = CAD_URL[vehicleKind] || CAD_URL.rocket;
 
-  return <group ref={group}>{mesh}</group>;
+  return (
+    <group ref={group}>
+      <CadFallbackBoundary fallback={procedural}>
+        <Suspense fallback={null}>
+          <CadMesh url={url} />
+        </Suspense>
+      </CadFallbackBoundary>
+    </group>
+  );
 }
 
 function Fallback() {
-  return (
-    <div className="body3d-fallback">
-      3D view unavailable
-    </div>
-  );
+  return <div className="body3d-fallback">3D view unavailable</div>;
 }
 
 /**
- * 3D tilt/body animation via react-three-fiber (PRD G6 / C.4).
+ * 3D tilt/body animation via react-three-fiber (PRD G6 / A.5.9).
+ * Real STEP→GLB CAD with procedural fallback.
  */
 export default function Body3D({ vehicle }) {
   const vehicleKind = vehicle === 'satellite' ? 'satellite' : 'rocket';
   const accent = vehicleKind === 'satellite' ? '#3dd6a5' : '#f0733d';
+  const cadLabel = vehicleKind === 'satellite' ? 'CanSat CAD' : 'Rocket CAD';
 
   return (
     <div className="body3d-panel" aria-label="3D attitude">
@@ -157,12 +218,21 @@ export default function Body3D({ vehicle }) {
             <directionalLight position={[-2, -1, -2]} intensity={0.35} color={accent} />
             <AttitudeBody vehicle={vehicle} vehicleKind={vehicleKind} />
             <gridHelper args={[4, 8, '#1e2a38', '#15202c']} position={[0, -0.9, 0]} />
+            <OrbitControls
+              enablePan={false}
+              enableDamping
+              minDistance={1.2}
+              maxDistance={6}
+            />
           </Canvas>
         </Suspense>
       </div>
       <div className="body3d-caption muted small">
-        {vehicleKind === 'satellite' ? 'CubeSat model' : 'Rocket model'} · live pitch/yaw/roll
+        {cadLabel} · live pitch/yaw/roll · drag to orbit
       </div>
     </div>
   );
 }
+
+useGLTF.preload(CAD_URL.rocket);
+useGLTF.preload(CAD_URL.satellite);

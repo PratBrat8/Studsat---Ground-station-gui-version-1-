@@ -15,7 +15,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import DEFAULT_BAUD
+from app.config import DEFAULT_BAUD, TEAM_ID
 
 router = APIRouter(tags=["control"])
 
@@ -37,6 +37,14 @@ class SimulateBody(BaseModel):
 
 class RecoverBody(BaseModel):
     vehicle: str
+
+
+class CommandBody(BaseModel):
+    vehicle: str
+    type: str = Field(..., description="TX | ST | CG | CB | CA | EJ")
+    on: Optional[bool] = None
+    utc_time: Optional[str] = None
+    confirmed: bool = False
 
 
 def _mgr(request: Request):
@@ -90,6 +98,8 @@ def get_status(request: Request) -> dict[str, Any]:
     return {
         "connections": mgr.status(),
         "vehicles": hub.connection_summary(),
+        "commands": mgr.commands.list_commands(limit=20),
+        "team_id": TEAM_ID,
     }
 
 
@@ -105,6 +115,37 @@ def post_recover(body: RecoverBody, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/command")
+def post_command(body: CommandBody, request: Request) -> dict[str, Any]:
+    mgr = _mgr(request)
+    try:
+        return mgr.send_command(
+            vehicle=body.vehicle,
+            cmd_type=body.type,
+            on=body.on,
+            utc_time=body.utc_time,
+            confirmed=body.confirmed,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        msg = str(exc)
+        code = 429 if "rate limited" in msg else 409
+        raise HTTPException(status_code=code, detail=msg) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"command failed: {exc}") from exc
+
+
+@router.get("/commands")
+def get_commands(
+    request: Request, vehicle: Optional[str] = None, limit: int = 50
+) -> dict[str, Any]:
+    mgr = _mgr(request)
+    return {"commands": mgr.commands.list_commands(vehicle=vehicle, limit=limit)}
 
 
 @router.get("/packets/{vehicle}")
@@ -147,6 +188,19 @@ class ReplayPauseBody(BaseModel):
 def get_replay_sessions(request: Request) -> dict[str, Any]:
     mgr = _mgr(request)
     return {"sessions": mgr.list_replay_sessions()}
+
+
+@router.get("/replay/commands")
+def get_replay_commands(
+    request: Request, filename: str
+) -> dict[str, Any]:
+    """Session command log for Replay tab (PRD v2 Phase 12)."""
+    mgr = _mgr(request)
+    try:
+        commands = mgr.list_replay_commands(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"filename": filename, "commands": commands}
 
 
 @router.post("/replay/load")

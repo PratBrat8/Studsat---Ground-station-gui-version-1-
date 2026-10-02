@@ -25,6 +25,9 @@ function VehicleSettingsCard({ vehicle, title, accentClass }) {
   const mode = useSettingsStore((s) =>
     vehicle === 'rocket' ? s.rocketMode : s.satelliteMode
   );
+  const diag = useSettingsStore(
+    (s) => s.backendConnections?.connections?.[vehicle]
+  );
   const setPort = useSettingsStore((s) =>
     vehicle === 'rocket' ? s.setRocketPort : s.setSatellitePort
   );
@@ -86,6 +89,16 @@ function VehicleSettingsCard({ vehicle, title, accentClass }) {
           Streams synthetic frames through the real protocol parser (not a UI
           mock).
         </p>
+        {diag && (
+          <p className="hint" style={{ marginTop: '0.35rem' }}>
+            Link {diag.link_state || 'DISCONNECTED'}
+            {diag.reconnect_count
+              ? ` · reconnects ${diag.reconnect_count}`
+              : ''}
+            {diag.open_failures ? ` · open fails ${diag.open_failures}` : ''}
+            {diag.last_error ? ` · ${diag.last_error}` : ''}
+          </p>
+        )}
       </div>
 
       <div className="settings-row serial-block" aria-disabled={simulate}>

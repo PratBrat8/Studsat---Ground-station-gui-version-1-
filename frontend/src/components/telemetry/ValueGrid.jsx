@@ -22,14 +22,26 @@ export default function ValueGrid({ vehicle }) {
   const gps = useStore((s) => s.gps);
   const link = useStore((s) => s.link);
   const packets = useStore((s) => s.packets);
+  const signal = useStore((s) => s.signal);
 
   const battWarn = t.battery_v != null && t.battery_v < 7.0;
   const linkWarn = link.state && link.state !== 'CONNECTED';
-  const crcWarn = (packets.frames_crc_error ?? link.crc_error_count ?? 0) > 0;
+  const crcWarn =
+    (packets.transport_malformed ??
+      packets.frames_crc_error ??
+      link.crc_error_count ??
+      0) > 0 || (packets.app_parse_error ?? 0) > 0;
 
   return (
     <div className="value-grid" aria-label={`${vehicle} value grid`}>
-      <Cell label="Altitude" value={fmt(t.altitude_m, 1, 'm')} accent="hi" />
+      <Cell
+        label="Baro alt"
+        value={fmt(t.altitude_m, 1, 'm')}
+        accent="hi"
+        warn={Boolean(t.altitude_disagreement)}
+        sub={t.altitude_disagreement ? 'GNSS disagree' : undefined}
+      />
+      <Cell label="GNSS alt" value={fmt(t.altitude_gnss_m ?? gps.alt_m, 1, 'm')} />
       <Cell label="V. Speed" value={fmt(t.speed_mps, 2, 'm/s')} />
       <Cell label="Pitch" value={fmt(t.pitch, 1, '°')} />
       <Cell label="Yaw" value={fmt(t.yaw, 1, '°')} />
@@ -38,7 +50,13 @@ export default function ValueGrid({ vehicle }) {
         label="Battery"
         value={fmt(t.battery_v, 2, 'V')}
         warn={battWarn}
-        sub={battWarn ? 'low' : undefined}
+        sub={
+          battWarn
+            ? 'low'
+            : t.battery_pct != null
+              ? `~${Math.round(t.battery_pct)}% assumed`
+              : undefined
+        }
       />
       <Cell label="Temp" value={fmt(t.temperature_c, 1, '°C')} />
       <Cell label="Pressure" value={fmt(t.pressure_hpa, 1, 'hPa')} />
@@ -58,6 +76,11 @@ export default function ValueGrid({ vehicle }) {
         value={fmt(link.packet_rate_hz, 1, 'Hz')}
         warn={linkWarn || crcWarn}
         sub={link.state || 'DISCONNECTED'}
+      />
+      <Cell
+        label="RSSI"
+        value={signal.rssi != null ? `${signal.rssi} dBm` : '—'}
+        sub={signal.snr != null ? `SNR ${fmt(signal.snr, 1)}` : undefined}
       />
     </div>
   );

@@ -1,9 +1,10 @@
 """
-CSV session logger + replay file loader (PRD C.3 / Phase 10).
+CSV session logger + replay file loader (PRD C.3 / Phase 12).
 
 - Continuous append during live/sim sessions (flushed often — not only on disconnect).
-- list_sessions() for Replay tab.
-- load_session() yields rows; ReplayPlayer feeds the real hub via encode/parser path.
+- Per-session command log written next to the telemetry CSV.
+- list_sessions() for Replay tab (skips commands.csv / *_commands.csv).
+- load_session() yields rows; ReplayPlayer feeds the real hub via +RCV parse path.
 """
 from __future__ import annotations
 
@@ -16,22 +17,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from app.config import LOGS_DIR
-from app.frame_parser import FrameParser
+from app.command_manager import COMMAND_LOG_FIELDS, STATUS_TRANSMITTED
+from app.config import CANSAT_VEHICLE_ADDR, LOGS_DIR, ROCKET_VEHICLE_ADDR, TEAM_ID
 from app.protocol import (
-    TYPE_EVENT,
-    TYPE_GPS,
-    TYPE_STATUS,
-    TYPE_TELEMETRY,
     VEHICLE_ROCKET,
     VEHICLE_SATELLITE,
-    EventFrame,
-    GpsFrame,
-    RawFrame,
-    StatusFrame,
-    TelemetryFrame,
-    encode_packet,
+    FlightState,
+    TelemetryRecord,
+    format_telemetry_csv,
 )
+from app.radio_transport import RadioLineBuffer, RadioPacket, format_rcv_line
+
+GLOBAL_COMMANDS_FILENAME = "commands.csv"
 
 CSV_FIELDS = [
     "wall_time_iso",
@@ -71,6 +68,10 @@ CSV_FIELDS = [
     "link_state",
     "frames_ok",
     "frames_crc_error",
+    "csv",
+    "rssi",
+    "snr",
+    "flight_software_state",
 ]
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -96,14 +97,24 @@ class SessionLogger:
         self.vehicle = vehicle.lower()
         self.logs_dir = Path(logs_dir or LOGS_DIR)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.filename = f"{self.vehicle}_{_session_stamp()}.csv"
+        stamp = _session_stamp()
+        self.filename = f"{self.vehicle}_{stamp}.csv"
+        self.command_filename = f"{self.vehicle}_{stamp}_commands.csv"
         self.path = self.logs_dir / self.filename
+        self.command_path = self.logs_dir / self.command_filename
         self._lock = threading.Lock()
         self._file = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=CSV_FIELDS, extrasaction="ignore")
         self._writer.writeheader()
         self._file.flush()
+        self._cmd_file = self.command_path.open("w", newline="", encoding="utf-8")
+        self._cmd_writer = csv.DictWriter(
+            self._cmd_file, fieldnames=COMMAND_LOG_FIELDS, extrasaction="ignore"
+        )
+        self._cmd_writer.writeheader()
+        self._cmd_file.flush()
         self.sample_count = 0
+        self.command_count = 0
         self.started_at = time.time()
         self._closed = False
 
@@ -120,6 +131,18 @@ class SessionLogger:
             except Exception:
                 pass
 
+    def log_command(self, row: Dict[str, Any]) -> None:
+        if self._closed:
+            return
+        out = {k: row.get(k, "") for k in COMMAND_LOG_FIELDS}
+        with self._lock:
+            try:
+                self._cmd_writer.writerow(out)
+                self.command_count += 1
+                self._cmd_file.flush()
+            except Exception:
+                pass
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -130,14 +153,31 @@ class SessionLogger:
                 self._file.close()
             except Exception:
                 pass
+            try:
+                self._cmd_file.flush()
+                self._cmd_file.close()
+            except Exception:
+                pass
+
+
+def is_command_log_filename(name: str) -> bool:
+    n = Path(name).name.lower()
+    return n == GLOBAL_COMMANDS_FILENAME or n.endswith("_commands.csv")
+
+
+def command_log_name_for(telemetry_filename: str) -> str:
+    stem = Path(telemetry_filename).stem
+    return f"{stem}_commands.csv"
 
 
 def list_sessions(logs_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Scan logs/ for session CSVs (PRD C.3)."""
+    """Scan logs/ for telemetry session CSVs (PRD C.3 / Phase 12)."""
     root = Path(logs_dir or LOGS_DIR)
     root.mkdir(parents=True, exist_ok=True)
     sessions: List[Dict[str, Any]] = []
     for path in sorted(root.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if is_command_log_filename(path.name):
+            continue
         info = _inspect_session(path)
         if info:
             sessions.append(info)
@@ -180,6 +220,21 @@ def _inspect_session(path: Path) -> Optional[Dict[str, Any]]:
             duration_s = float(sample_count) / 10.0  # rough
 
         mtime = path.stat().st_mtime
+        cmd_name = command_log_name_for(path.name)
+        cmd_path = path.with_name(cmd_name)
+        command_count = 0
+        command_log = None
+        if cmd_path.is_file():
+            command_log = cmd_name
+            try:
+                with cmd_path.open("r", newline="", encoding="utf-8") as cf:
+                    ids = {
+                        (r.get("command_id") or "").strip()
+                        for r in csv.DictReader(cf)
+                    }
+                    command_count = len({i for i in ids if i})
+            except Exception:
+                command_count = 0
         return {
             "filename": path.name,
             "vehicle": vehicle,
@@ -187,6 +242,8 @@ def _inspect_session(path: Path) -> Optional[Dict[str, Any]]:
             "end_time": end_iso,
             "duration_s": round(duration_s, 2),
             "sample_count": sample_count,
+            "command_count": command_count,
+            "command_log": command_log,
             "size_bytes": path.stat().st_size,
             "path": str(path.resolve()),
         }
@@ -212,88 +269,130 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
-def load_session(filename: str, logs_dir: Optional[Path] = None) -> Iterator[Dict[str, Any]]:
-    """Yield CSV rows as dicts (safe path under logs_dir only)."""
+def _safe_log_path(filename: str, logs_dir: Optional[Path] = None) -> Path:
     root = Path(logs_dir or LOGS_DIR).resolve()
-    # Prevent path traversal
     safe = _SAFE_NAME.sub("", Path(filename).name)
     path = (root / safe).resolve()
     if not str(path).startswith(str(root)) or not path.is_file():
         raise FileNotFoundError(f"session not found: {filename}")
+    return path
 
+
+def load_session(filename: str, logs_dir: Optional[Path] = None) -> Iterator[Dict[str, Any]]:
+    """Yield CSV rows as dicts (safe path under logs_dir only)."""
+    path = _safe_log_path(filename, logs_dir=logs_dir)
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             yield dict(row)
 
 
+def load_session_commands(
+    filename: str, logs_dir: Optional[Path] = None
+) -> List[Dict[str, Any]]:
+    """
+    Last status per command id from the sibling session command CSV.
+    `filename` is the telemetry session name (rocket_….csv).
+    """
+    if is_command_log_filename(filename):
+        cmd_name = Path(filename).name
+    else:
+        cmd_name = command_log_name_for(filename)
+    root = Path(logs_dir or LOGS_DIR).resolve()
+    path = (root / _SAFE_NAME.sub("", cmd_name)).resolve()
+    if not str(path).startswith(str(root)) or not path.is_file():
+        return []
+    latest: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cid = (row.get("command_id") or "").strip() or f"row-{len(order)}"
+            status = (row.get("status") or "").strip()
+            mapped = {
+                "id": cid,
+                "vehicle": row.get("vehicle") or "",
+                "type": row.get("cmd_type") or "",
+                "command": row.get("command_str") or "",
+                "status": status,
+                "error": row.get("error") or None,
+                "confirmed": str(row.get("confirmed", "")).lower() in ("1", "true"),
+                "dest_addr": row.get("dest_addr"),
+                "sent_at": row.get("wall_time_iso") or "",
+                "note": (
+                    "transmitted, not confirmed by vehicle"
+                    if status == STATUS_TRANSMITTED
+                    else None
+                ),
+            }
+            if cid not in latest:
+                order.append(cid)
+            latest[cid] = mapped
+    return [latest[cid] for cid in order]
+
+
 def row_to_wire_bytes(row: Dict[str, Any], vehicle_id: int, seq: int) -> Optional[bytes]:
-    """
-    Rebuild a protocol frame from a log row.
-    Prefer raw_hex when present; else reconstruct from typed fields.
-    """
+    """Rebuild a +RCV line from a log row (v2 ASCII path)."""
+    if row.get("cmd_type") and not row.get("csv") and not row.get("raw_hex"):
+        return None
     raw = (row.get("raw_hex") or "").strip()
     if raw:
         try:
-            return bytes.fromhex(raw.replace(" ", ""))
+            blob = bytes.fromhex(raw.replace(" ", ""))
+            if blob.startswith(b"+RCV="):
+                if not blob.endswith(b"\n"):
+                    blob += b"\r\n"
+                return blob
         except ValueError:
             pass
+        csv_inline = (row.get("csv") or "").strip()
+        if csv_inline:
+            addr = (
+                ROCKET_VEHICLE_ADDR
+                if vehicle_id == VEHICLE_ROCKET
+                else CANSAT_VEHICLE_ADDR
+            )
+            rssi = _to_int(row.get("rssi")) or -70
+            snr = _to_float(row.get("snr")) or 8.0
+            return format_rcv_line(addr, csv_inline, rssi, snr).encode("utf-8")
 
-    ptype = _to_int(row.get("packet_type"))
-    if ptype is None:
-        # Default to telemetry if we have altitude
-        if row.get("altitude_m") not in (None, ""):
-            ptype = TYPE_TELEMETRY
-        elif row.get("gps_lat") not in (None, ""):
-            ptype = TYPE_GPS
-        elif row.get("event"):
-            ptype = TYPE_EVENT
-        else:
-            return None
-
+    if row.get("altitude_m") in (None, "") and not row.get("csv"):
+        return None
     try:
-        if ptype == TYPE_TELEMETRY:
-            frame = TelemetryFrame(
-                timestamp_ms=_to_int(row.get("timestamp_ms")) or 0,
-                altitude_m=_to_float(row.get("altitude_m")) or 0.0,
-                pressure_hpa=_to_float(row.get("pressure_hpa")) or 0.0,
-                temperature_c=_to_float(row.get("temperature_c")) or 0.0,
-                accel_x=_to_float(row.get("accel_x")) or 0.0,
-                accel_y=_to_float(row.get("accel_y")) or 0.0,
-                accel_z=_to_float(row.get("accel_z")) or 9.8,
-                gyro_x=_to_float(row.get("gyro_x")) or 0.0,
-                gyro_y=_to_float(row.get("gyro_y")) or 0.0,
-                gyro_z=_to_float(row.get("gyro_z")) or 0.0,
-                pitch=_to_float(row.get("pitch")) or 0.0,
-                yaw=_to_float(row.get("yaw")) or 0.0,
-                roll=_to_float(row.get("roll")) or 0.0,
-                battery_v=_to_float(row.get("battery_v")) or 0.0,
-            )
-            return encode_packet(vehicle_id, seq & 0xFF, frame)
-        if ptype == TYPE_GPS:
-            frame = GpsFrame(
-                gps_timestamp=_to_int(row.get("timestamp_ms")) or 0,
-                lat=_to_float(row.get("gps_lat")) or 0.0,
-                lon=_to_float(row.get("gps_lon")) or 0.0,
-                alt_msl_m=_to_float(row.get("gps_alt_m")) or 0.0,
-                num_sats=_to_int(row.get("gps_sats")) or 0,
-                hdop=_to_float(row.get("gps_hdop")) or 1.0,
-                fix_type=_to_int(row.get("gps_fix_type")) or 0,
-            )
-            return encode_packet(vehicle_id, seq & 0xFF, frame)
-        if ptype == TYPE_STATUS:
-            frame = StatusFrame(
-                phase_hint=0,
-                battery_v=_to_float(row.get("battery_v")) or 0.0,
-                error_flags=0,
-            )
-            return encode_packet(vehicle_id, seq & 0xFF, frame)
-        if ptype == TYPE_EVENT:
-            msg = row.get("event") or "EVENT"
-            return encode_packet(vehicle_id, seq & 0xFF, EventFrame(message=str(msg)))
+        rec = TelemetryRecord(
+            team_id=str(row.get("team_id") or TEAM_ID),
+            timestamp=str(row.get("timestamp") or "00:00:00"),
+            packet_count=_to_int(row.get("seq")) or seq,
+            altitude_m=_to_float(row.get("altitude_m")) or 0.0,
+            pressure=_to_float(row.get("pressure_hpa")) or 0.0,
+            temp_c=_to_float(row.get("temperature_c")) or 0.0,
+            voltage=_to_float(row.get("battery_v")) or 0.0,
+            gnss_time=str(row.get("timestamp") or "00:00:00"),
+            gnss_lat=_to_float(row.get("gps_lat")) or 0.0,
+            gnss_lon=_to_float(row.get("gps_lon")) or 0.0,
+            gnss_alt_m=_to_float(row.get("gps_alt_m")) or 0.0,
+            gnss_sats=_to_int(row.get("gps_sats")) or 0,
+            accel_x=_to_float(row.get("accel_x")) or 0.0,
+            accel_y=_to_float(row.get("accel_y")) or 0.0,
+            accel_z=_to_float(row.get("accel_z")) or 9.8,
+            gyro_x=_to_float(row.get("gyro_x")) or 0.0,
+            gyro_y=_to_float(row.get("gyro_y")) or 0.0,
+            gyro_z=_to_float(row.get("gyro_z")) or 0.0,
+            flight_software_state=_to_int(row.get("flight_software_state"))
+            or int(FlightState.LAUNCH_PAD),
+        )
+        addr = (
+            ROCKET_VEHICLE_ADDR
+            if vehicle_id == VEHICLE_ROCKET
+            else CANSAT_VEHICLE_ADDR
+        )
+        rssi = _to_int(row.get("rssi")) or -70
+        snr = _to_float(row.get("snr")) or 8.0
+        return format_rcv_line(addr, format_telemetry_csv(rec), rssi, snr).encode(
+            "utf-8"
+        )
     except Exception:
         return None
-    return None
 
 
 @dataclass
@@ -335,6 +434,8 @@ class ReplayPlayer:
         logs_dir: Optional[Path] = None,
     ) -> ReplayStatus:
         self.stop()
+        if is_command_log_filename(filename):
+            raise ValueError("that file is a command log — pick the telemetry session CSV")
         rows = list(load_session(filename, logs_dir=logs_dir))
         if not rows:
             raise ValueError("session has no samples")
@@ -425,7 +526,7 @@ class ReplayPlayer:
                 pass
 
     def _run(self, rows: List[Dict[str, Any]], vehicle: str, speed: float) -> None:
-        parser = FrameParser()
+        parser = RadioLineBuffer()
         vehicle_id = _VEHICLE_IDS.get(vehicle, VEHICLE_ROCKET)
         prev_ms: Optional[int] = None
         seq_fallback = 0
@@ -465,17 +566,19 @@ class ReplayPlayer:
                 if not wire:
                     continue
                 try:
-                    frames = parser.feed(wire)
-                    for fr in frames:
-                        self.hub.ingest_raw_frame(
+                    items = parser.feed(wire)
+                    for item in items:
+                        if not isinstance(item, RadioPacket):
+                            continue
+                        self.hub.ingest_radio_packet(
                             vehicle,
-                            fr,
+                            item,
                             {
-                                "frames_ok": parser.frames_ok,
-                                "frames_crc_error": parser.frames_crc_error,
-                                "frames_resynced": parser.frames_resynced,
+                                "frames_ok": parser.stats.rcv_ok,
+                                "frames_crc_error": parser.stats.rcv_malformed,
+                                "frames_resynced": parser.oversize_resets,
                             },
-                            logging_enabled=False,  # don't re-log replay
+                            logging_enabled=False,
                         )
                 except Exception:
                     pass
@@ -495,27 +598,32 @@ class ReplayPlayer:
 
 def build_log_row_from_state(
     vehicle: str,
-    frame: RawFrame,
+    packet: RadioPacket,
     state: Any,
     wall_ms: int,
     type_name: str = "",
 ) -> Dict[str, Any]:
-    """Flatten hub vehicle state + frame into a CSV row."""
+    """Flatten hub vehicle state + radio packet into a CSV row."""
     t = getattr(state, "telemetry", {}) or {}
     g = getattr(state, "gps", {}) or {}
     pred = getattr(state, "prediction", None) or {}
     events = list(getattr(state, "events", []) or [])
     event = events[0] if events else ""
+    seq = t.get("packet_count", "")
+    raw = (packet.raw_line or "").encode("utf-8", errors="replace")
 
     return {
         "wall_time_iso": _iso_now(),
         "wall_ms": wall_ms,
         "vehicle": vehicle,
         "phase": getattr(state, "phase", ""),
-        "seq": frame.seq,
-        "packet_type": frame.packet_type,
-        "packet_type_name": type_name,
-        "raw_hex": frame.raw_bytes.hex(" "),
+        "seq": seq,
+        "packet_type": 1,
+        "packet_type_name": type_name or "TELEMETRY",
+        "raw_hex": raw.hex(" "),
+        "csv": packet.data,
+        "rssi": packet.rssi,
+        "snr": packet.snr,
         "altitude_m": t.get("altitude_m", ""),
         "speed_mps": t.get("speed_mps", ""),
         "pitch": t.get("pitch", ""),
@@ -537,7 +645,7 @@ def build_log_row_from_state(
         "gps_sats": g.get("sats", ""),
         "gps_hdop": g.get("hdop", ""),
         "gps_fix_type": g.get("fix_type", ""),
-        "event": event if frame.packet_type == TYPE_EVENT else "",
+        "event": event,
         "prediction_lat": pred.get("lat", "") if pred else "",
         "prediction_lon": pred.get("lon", "") if pred else "",
         "prediction_eta_s": pred.get("eta_s", "") if pred else "",
@@ -545,4 +653,5 @@ def build_log_row_from_state(
         "link_state": getattr(state, "link_state", ""),
         "frames_ok": getattr(state, "frames_ok", ""),
         "frames_crc_error": getattr(state, "frames_crc_error", ""),
+        "flight_software_state": t.get("flight_software_state", ""),
     }

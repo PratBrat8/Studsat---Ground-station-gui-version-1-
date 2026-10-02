@@ -132,6 +132,54 @@ export async function refreshBackendStatus() {
 }
 
 /**
+ * After backend crash recovery: adopt server connection modes and reopen WS.
+ */
+export async function onBackendRecovered() {
+  try {
+    const data = await refreshBackendStatus();
+    const conns = data?.connections || {};
+    const settings = useSettingsStore.getState();
+    for (const v of ['rocket', 'satellite']) {
+      const mode = conns[v]?.mode || null;
+      settings.setConnectionMode(v, mode);
+      const sim = mode === 'sim';
+      if (v === 'rocket') settings.setRocketSimulate(sim);
+      else settings.setSatelliteSimulate(sim);
+      if (mode === 'sim' || mode === 'serial' || mode === 'replay') {
+        openVehicleStream(v);
+      }
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send an uplink command and store the status chip (SENT / TRANSMITTED / …).
+ * EJ and TX OFF must pass { confirmed: true } — hold-to-confirm UI sets it.
+ */
+export async function sendVehicleCommand(vehicle, type, extra = {}) {
+  const rec = await api.sendCommand(vehicle, type, extra);
+  const store = storeFor(vehicle).getState();
+  store.setLastCommand(rec);
+  try {
+    const listed = await api.listCommands(vehicle, 50);
+    store.setCommands(listed.commands || []);
+  } catch {
+    const prev = store.commands || [];
+    store.setCommands([rec, ...prev].slice(0, 50));
+  }
+  return rec;
+}
+
+export async function refreshCommands(vehicle) {
+  const listed = await api.listCommands(vehicle, 50);
+  storeFor(vehicle).getState().setCommands(listed.commands || []);
+  return listed.commands || [];
+}
+
+/**
  * Start CSV replay into a vehicle pipeline (real parser path on backend).
  * Opens WS so live panels update.
  */

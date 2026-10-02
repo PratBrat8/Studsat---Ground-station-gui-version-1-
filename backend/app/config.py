@@ -49,7 +49,40 @@ REPO_ROOT = BACKEND_DIR.parent if not getattr(sys, "frozen", False) else APP_DIR
 # ---------------------------------------------------------------------------
 HOST = os.environ.get("STUDSAT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("STUDSAT_PORT", "8765"))
-DEFAULT_BAUD = 115200  # [ASSUMED] — confirm with firmware team
+
+# ---------------------------------------------------------------------------
+# Competition identity
+# ---------------------------------------------------------------------------
+# TEMPORARY/UNCONFIRMED — replace with the real competition TEAM_ID.
+TEAM_ID = os.environ.get("STUDSAT_TEAM_ID", "XXXX")
+
+# ---------------------------------------------------------------------------
+# Reyax RYLR993 (PRD v2 C.2 / Appendix 1.6)
+# TEMPORARY/UNCONFIRMED — baud and addresses are placeholders until the
+# real USB dongles are configured and measured.
+# ---------------------------------------------------------------------------
+REYAX_BAUD = int(os.environ.get("STUDSAT_REYAX_BAUD", "115200"))
+DEFAULT_BAUD = REYAX_BAUD  # serial_manager still reads DEFAULT_BAUD
+
+# Ground module on the rocket/avionics band (we send AT+SEND from here).
+GROUND_ROCKET_ADDR = 0
+# Teensy 4.1 / avionics Reyax (downlink sender, EJ uplink destination).
+ROCKET_VEHICLE_ADDR = 1
+# Ground module on the CanSat band.
+GROUND_CANSAT_ADDR = 2
+# Raspberry Pi Zero 2W / CanSat Reyax.
+CANSAT_VEHICLE_ADDR = 3
+
+# TEMPORARY/UNCONFIRMED (Appendix 1.3): firmware does NOT send an
+# application-level "command executed" ACK. UI may only show
+# SENT → TRANSMITTED (+OK). Never invent ACKED.
+COMMAND_APP_ACK_ENABLED = False
+COMMAND_ACK_TIMEOUT_S = 3.0
+COMMAND_RATE_LIMIT_S = 3.0
+
+# Manual ejection is sent on the Rocket/Avionics radio line only
+# (Appendix 1.7, TEMPORARY/UNCONFIRMED until firmware confirms).
+EJECTION_VEHICLE = "rocket"
 
 # ---------------------------------------------------------------------------
 # Telemetry hub
@@ -68,6 +101,10 @@ LANDED_ALT_EPS_M = 5.0
 LANDED_SPEED_EPS = 1.0  # m/s
 LANDED_CONFIRM_SAMPLES = 15
 PREDICTION_WINDOW_SAMPLES = 15
+# TEMPORARY/UNCONFIRMED — dual-altitude failsafe threshold (PRD v2 C.6).
+ALTITUDE_DISAGREEMENT_THRESHOLD_M = 30.0
+# TEMPORARY/UNCONFIRMED — ASCENT trend-line window (PRD v2 C.7).
+TRAJECTORY_TREND_WINDOW_SAMPLES = 10
 
 # ---------------------------------------------------------------------------
 # Serial reconnect backoff (seconds)

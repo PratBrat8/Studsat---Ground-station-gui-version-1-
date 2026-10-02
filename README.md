@@ -2,7 +2,7 @@
 
 Offline desktop ground station for **Rocket** + **Satellite** telemetry (university STUDSAT team).
 
-Spec: `STUDSAT_Ground_Station_PRD.md` (single source of truth). Build order: **Part D** phases 1–12.
+Spec: `docs/STUDSAT_Ground_Station_PRD_v2.md` (single source of truth). Build order: **Part D** phases 1–14.
 
 | Layer | Stack |
 |--------|--------|
@@ -14,15 +14,15 @@ Spec: `STUDSAT_Ground_Station_PRD.md` (single source of truth). Build order: **P
 
 ---
 
-## Current phase: 12 — Packaging (v1.0)
+## Current phase: 14 — Packaging (v2.0)
 
-All PRD build phases **1–12** are implemented.
+All PRD v2 build phases **1–14** are implemented.
 
 **Package (Windows NSIS, offline):**
 
 ```powershell
 .\scripts\package-windows.ps1
-# → electron\dist\STUDSAT-Ground-Station-Setup-1.0.0.exe
+# → electron\dist\STUDSAT-Ground-Station-Setup-2.0.0.exe
 ```
 
 Details: [`docs/PACKAGING.md`](docs/PACKAGING.md)

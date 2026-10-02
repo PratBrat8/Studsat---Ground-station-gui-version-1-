@@ -1,7 +1,7 @@
 """
 STUDSAT Ground Station — FastAPI backend entry point.
 
-Phase 12: runs as `python -m app.main` in dev, or as frozen studsat-backend.exe.
+Phase 14: runs as `python -m app.main` in dev, or as frozen studsat-backend.exe.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from app.telemetry_hub import TelemetryHub
 from app.tile_server import router as tile_router
 from app.ws_routes import router as ws_router
 
-APP_VERSION = "1.0.0-phase12"
+APP_VERSION = "2.0.0-phase14"
 
 
 @asynccontextmanager
@@ -78,11 +78,13 @@ app.include_router(tile_router)
 
 @app.get("/health")
 def health() -> dict:
-    """Used by Electron main process; includes light diagnostics (Phase 11)."""
+    """Used by Electron main process; includes light diagnostics (Phase 14)."""
     body: dict = {
         "status": "ok",
         "version": APP_VERSION,
         "phase": 12,
+        "prd_version": 2,
+        "v2_phase": 14,
         "service": "studsat-ground-station",
         "frozen": bool(getattr(sys, "frozen", False)),
         "tiles_dir": str(TILES_DIR),

@@ -9,8 +9,15 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, Optional, Union
 
-from app.logger import ReplayPlayer, SessionLogger, list_sessions
-from app.protocol import VEHICLE_ROCKET, VEHICLE_SATELLITE, RawFrame
+from app.command_manager import CommandManager
+from app.logger import (
+    ReplayPlayer,
+    SessionLogger,
+    list_sessions,
+    load_session_commands,
+)
+from app.protocol import VEHICLE_ROCKET, VEHICLE_SATELLITE
+from app.radio_transport import MalformedRadioLine, ModuleErr, ModuleOk, RadioPacket
 from app.serial_manager import SerialVehicleLink, list_available_ports
 from app.simulator import SimulatedVehicleLink
 from app.telemetry_hub import VEHICLES, TelemetryHub
@@ -31,6 +38,7 @@ class ConnectionManager:
         self._modes: Dict[str, Optional[str]] = {v: None for v in VEHICLES}
         self._loggers: Dict[str, Optional[SessionLogger]] = {v: None for v in VEHICLES}
         self.replay = ReplayPlayer(hub)
+        self.commands = CommandManager()
 
     def list_ports(self) -> list:
         return list_available_ports()
@@ -82,10 +90,11 @@ class ConnectionManager:
                     vehicle_id=_VEHICLE_IDS[vehicle],
                     port=port,
                     baud=baud,
-                    on_frame_callback=self._on_frame,
+                    on_radio_callback=self._on_radio,
                     on_link_state=self._on_link_state,
                 )
                 link.start()
+                self.commands.set_writer(vehicle, link.write)
             except Exception as exc:
                 self._stop_logger(vehicle)
                 raise ValueError(f"serial start failed: {exc}") from exc
@@ -121,13 +130,14 @@ class ConnectionManager:
             self._start_logger(vehicle)
             link = SimulatedVehicleLink(
                 vehicle_id=_VEHICLE_IDS[vehicle],
-                on_frame_callback=self._on_frame,
+                on_radio_callback=self._on_radio,
                 on_link_state=self._on_link_state,
                 hz=10.0,
             )
             self._links[vehicle] = link
             self._modes[vehicle] = "sim"
             link.start()
+            self.commands.set_writer(vehicle, link.write)
             self.hub.set_link_state(vehicle, "CONNECTED")
         return {
             "ok": True,
@@ -142,6 +152,9 @@ class ConnectionManager:
         with self._lock:
             return self._stop_unlocked(vehicle)
 
+    def send_command(self, **kwargs) -> Dict[str, Any]:
+        return self.commands.send_command(**kwargs)
+
     def stop_all(self) -> None:
         try:
             self.replay.stop()
@@ -150,11 +163,18 @@ class ConnectionManager:
         with self._lock:
             for v in list(VEHICLES):
                 self._stop_unlocked(v)
+        try:
+            self.commands.close()
+        except Exception:
+            pass
 
     # --- Replay (Phase 10) ---
 
     def list_replay_sessions(self) -> list:
         return list_sessions()
+
+    def list_replay_commands(self, filename: str) -> list:
+        return load_session_commands(filename)
 
     def start_replay(
         self, filename: str, speed: float = 1.0, vehicle: Optional[str] = None
@@ -196,14 +216,17 @@ class ConnectionManager:
             logger = SessionLogger(vehicle)
             self._loggers[vehicle] = logger
             self.hub.set_session_logger(vehicle, logger)
+            self.commands.set_session_sink(vehicle, logger.log_command)
         except Exception:
             self._loggers[vehicle] = None
             self.hub.set_session_logger(vehicle, None)
+            self.commands.set_session_sink(vehicle, None)
 
     def _stop_logger(self, vehicle: str) -> None:
         logger = self._loggers.get(vehicle)
         self._loggers[vehicle] = None
         self.hub.set_session_logger(vehicle, None)
+        self.commands.set_session_sink(vehicle, None)
         if logger is not None:
             try:
                 logger.close()
@@ -213,6 +236,7 @@ class ConnectionManager:
     def _stop_unlocked(self, vehicle: str) -> Dict[str, Any]:
         link = self._links.pop(vehicle, None)
         self._modes[vehicle] = None
+        self.commands.set_writer(vehicle, None)
         if link is not None:
             try:
                 link.stop()
@@ -224,6 +248,10 @@ class ConnectionManager:
         if logger:
             log_file = logger.filename
             samples = logger.sample_count
+        try:
+            self.commands.fail_inflight(vehicle, "link disconnected")
+        except Exception:
+            pass
         self._stop_logger(vehicle)
         self.hub.set_link_state(vehicle, "DISCONNECTED")
         return {
@@ -241,19 +269,50 @@ class ConnectionManager:
             raise ValueError(f"vehicle must be one of {VEHICLES}, got {vehicle!r}")
         return v
 
-    def _on_frame(self, vehicle_key: str, frame: RawFrame) -> None:
-        stats = None
+    def _parser_stats(self, vehicle_key: str) -> Optional[Dict[str, int]]:
         with self._lock:
             link = self._links.get(vehicle_key)
-            if link is not None:
-                p = link.parser
-                stats = {
-                    "frames_ok": p.frames_ok,
-                    "frames_crc_error": p.frames_crc_error,
-                    "frames_resynced": p.frames_resynced,
-                }
+            if link is None:
+                return None
+            p = link.parser
+            s = p.stats
+            return {
+                "frames_ok": s.rcv_ok,
+                "frames_crc_error": s.rcv_malformed,
+                "frames_resynced": p.oversize_resets,
+                "transport_ok": s.ok_responses,
+                "transport_err": s.err_responses,
+                "transport_unknown": s.unknown_lines,
+            }
+
+    def _on_radio(self, vehicle_key: str, item) -> None:
+        if isinstance(item, (ModuleOk, ModuleErr)):
+            try:
+                self.commands.on_module_response(vehicle_key, item)
+            except Exception:
+                pass
+            try:
+                self.hub.ingest_radio_event(
+                    vehicle_key, item, self._parser_stats(vehicle_key)
+                )
+            except Exception:
+                pass
+            return
+        if isinstance(item, MalformedRadioLine):
+            try:
+                self.hub.ingest_radio_event(
+                    vehicle_key, item, self._parser_stats(vehicle_key)
+                )
+            except Exception:
+                pass
+            return
+        if not isinstance(item, RadioPacket):
+            return
+        stats = self._parser_stats(vehicle_key)
         try:
-            self.hub.ingest_raw_frame(vehicle_key, frame, stats, logging_enabled=True)
+            self.hub.ingest_radio_packet(
+                vehicle_key, item, stats, logging_enabled=True
+            )
         except Exception:
             pass
 
@@ -262,3 +321,8 @@ class ConnectionManager:
             self.hub.set_link_state(vehicle_key, state)
         except Exception:
             pass
+        if state in ("LINK_LOST", "DISCONNECTED"):
+            try:
+                self.commands.fail_inflight(vehicle_key, "link lost")
+            except Exception:
+                pass

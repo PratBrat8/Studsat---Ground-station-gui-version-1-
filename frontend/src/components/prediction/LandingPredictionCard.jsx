@@ -1,5 +1,5 @@
 import React from 'react';
-import { useVehicleStore } from '../../state/vehicleStore.js';
+import { useRocketStore, useVehicleStore } from '../../state/vehicleStore.js';
 import { useSettingsStore } from '../../state/settingsStore.js';
 import { markRecovered } from '../../services/api.js';
 import { fmt } from '../../utils/format.js';
@@ -19,13 +19,21 @@ export default function LandingPredictionCard({ vehicle }) {
   const prediction = useStore((s) => s.prediction);
   const phase = useStore((s) => s.phase);
   const gps = useStore((s) => s.gps);
+  const localSep = useStore((s) => s.cansat_separated);
+  const rocketSep = useRocketStore((s) => s.cansat_separated);
+  const primary = vehicle === 'satellite' && Boolean(localSep || rocketSep);
   const setActionError = useSettingsStore((s) => s.setActionError);
   const setBusy = useSettingsStore((s) => s.setBusy);
   const busy = useSettingsStore((s) => s.busy[vehicle]);
 
   const active =
     prediction &&
-    (phase === 'APOGEE' || phase === 'DESCENT' || phase === 'LANDED');
+    (phase === 'APOGEE' ||
+      phase === 'PAYLOAD_SEP' ||
+      phase === 'DESCENT' ||
+      phase === 'AEROBREAK_RELEASE' ||
+      phase === 'IMPACT' ||
+      phase === 'LANDED');
 
   const conf = (prediction?.confidence || 'LOW').toUpperCase();
   const confCls = CONF_CLASS[conf] || CONF_CLASS.LOW;
@@ -43,21 +51,27 @@ export default function LandingPredictionCard({ vehicle }) {
   };
 
   return (
-    <div className={`prediction-card ${active ? 'active' : ''}`}>
+    <div
+      className={`prediction-card ${active ? 'active' : ''} ${primary ? 'primary' : ''}`}
+    >
       <div className="prediction-card-head">
         <div className="panel-title">Landing prediction</div>
-        {active ? (
-          <span className={`conf-pill ${confCls}`}>{conf}</span>
-        ) : (
-          <span className="conf-pill conf-idle">—</span>
-        )}
+        <div className="prediction-pills">
+          {primary && <span className="conf-pill conf-primary">PRIMARY</span>}
+          {active ? (
+            <span className={`conf-pill ${confCls}`}>{conf}</span>
+          ) : (
+            <span className="conf-pill conf-idle">—</span>
+          )}
+        </div>
       </div>
 
       {!active && (
         <p className="muted small prediction-idle">
-          Estimate runs during <strong>APOGEE / DESCENT</strong> (kinematic
-          dead-reckoning — not a full flight sim). Confidence is High / Med /
-          Low, never a bare guarantee.
+          Estimate runs from <strong>PAYLOAD_SEP</strong> through descent
+          (kinematic dead-reckoning — not a full flight sim). Rocket and CanSat
+          each have their own predictor. Confidence is High / Med / Low, never
+          a bare guarantee.
         </p>
       )}
 
@@ -113,7 +127,7 @@ export default function LandingPredictionCard({ vehicle }) {
         </>
       )}
 
-      {phase === 'LANDED' && (
+      {(phase === 'LANDED' || phase === 'IMPACT') && (
         <div className="prediction-actions">
           <button
             type="button"

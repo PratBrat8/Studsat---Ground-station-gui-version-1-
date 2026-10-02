@@ -1,51 +1,54 @@
-"""Simulator emits real protocol frames through FrameParser (PRD Phase 2)."""
+"""Simulator emits +RCV wrapping CSV through both layers (PRD v2 Phase 2)."""
 from __future__ import annotations
 
 import sys
 import time
 from pathlib import Path
 
-import pytest
-
 _BACKEND = Path(__file__).resolve().parents[1]
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from app.frame_parser import FrameParser
 from app.protocol import (
-    TYPE_TELEMETRY,
+    CSV_FIELD_COUNT,
     VEHICLE_ROCKET,
     VEHICLE_SATELLITE,
-    decode_payload,
+    parse_telemetry_csv,
 )
-from app.simulator import SimulatedVehicleLink, generate_flight_bytes
+from app.radio_transport import RadioLineBuffer, RadioPacket
+from app.simulator import (
+    SimulatedVehicleLink,
+    decode_sim_stream,
+    generate_flight_bytes,
+)
 
 
-def test_generate_flight_bytes_parses_cleanly():
+def test_generate_flight_bytes_parses_both_layers():
     blob = generate_flight_bytes(
         vehicle_id=VEHICLE_ROCKET, duration_s=2.0, hz=10.0, seed=42
     )
     assert len(blob) > 100
-    parser = FrameParser()
-    frames = parser.feed(blob)
-    assert parser.frames_crc_error == 0
-    assert parser.frames_ok == len(frames)
-    assert len(frames) >= 20  # 2s * 10 Hz telem + some GPS
-    telem = [f for f in frames if f.packet_type == TYPE_TELEMETRY]
-    assert len(telem) >= 15
-    decoded = decode_payload(telem[0].packet_type, telem[0].payload)
-    assert decoded.battery_v > 0
+    pairs = decode_sim_stream(blob)
+    assert len(pairs) >= 15
+    for pkt, rec in pairs:
+        assert isinstance(pkt, RadioPacket)
+        assert pkt.address == 1  # ROCKET_VEHICLE_ADDR placeholder
+        assert pkt.rssi < 0
+        assert rec is not None
+        assert rec.voltage > 0
+        assert 0 <= rec.flight_software_state <= 7
+        assert len(pkt.data.split(",")) == CSV_FIELD_COUNT
 
 
-def test_sim_link_thread_emits_parsed_frames():
+def test_sim_link_thread_emits_radio_packets():
     received = []
 
-    def on_frame(vehicle_key, frame):
-        received.append((vehicle_key, frame))
+    def on_packet(vehicle_key, packet):
+        received.append((vehicle_key, packet))
 
     link = SimulatedVehicleLink(
         vehicle_id=VEHICLE_SATELLITE,
-        on_frame_callback=on_frame,
+        on_packet_callback=on_packet,
         hz=20.0,
         seed=7,
     )
@@ -59,21 +62,19 @@ def test_sim_link_thread_emits_parsed_frames():
 
     assert len(received) >= 10
     assert all(vk == "satellite" for vk, _ in received)
-    assert link.parser.frames_ok >= 10
-    assert link.parser.frames_crc_error == 0
-    # At least one telemetry sample with sensible altitude field
-    alts = []
-    for _, fr in received:
-        if fr.packet_type == TYPE_TELEMETRY:
-            alts.append(decode_payload(fr.packet_type, fr.payload).altitude_m)
+    assert link.parser.stats.rcv_ok >= 10
+    assert link.parser.stats.rcv_malformed == 0
+    recs = [parse_telemetry_csv(pkt.data) for _, pkt in received]
+    assert all(r is not None for r in recs)
+    alts = [r.altitude_m for r in recs if r is not None]
     assert alts
-    assert min(alts) >= -5.0  # AGL near pad can be ~0
+    assert min(alts) >= -5.0
 
 
 def test_sim_stop_is_idempotent():
     link = SimulatedVehicleLink(
         vehicle_id=VEHICLE_ROCKET,
-        on_frame_callback=lambda *_: None,
+        on_packet_callback=lambda *_: None,
         hz=5.0,
     )
     link.start()
@@ -81,3 +82,12 @@ def test_sim_stop_is_idempotent():
     link.stop()
     link.stop()
     assert not link.is_running
+
+
+def test_line_buffer_on_sim_blob():
+    blob = generate_flight_bytes(duration_s=1.0, hz=10.0, seed=1)
+    buf = RadioLineBuffer()
+    items = buf.feed(blob)
+    assert buf.stats.rcv_malformed == 0
+    assert len(items) >= 8
+    assert all(isinstance(i, RadioPacket) for i in items)

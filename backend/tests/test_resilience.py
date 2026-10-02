@@ -1,6 +1,8 @@
-"""Phase 11 — resilience: bad ports, garbage frames, API stability."""
+"""Phase 13 — reconnect, malformed lines, command timeout, crash-safe APIs."""
 from __future__ import annotations
 
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -12,11 +14,16 @@ if str(_BACKEND) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from app.frame_parser import FrameParser
 from app.main import app
-from app.protocol import VEHICLE_ROCKET, TelemetryFrame, encode_packet
+from app.protocol import (
+    VEHICLE_ROCKET,
+    FlightState,
+    TelemetryRecord,
+    format_telemetry_csv,
+)
+from app.radio_transport import RadioLineBuffer, format_rcv_line, parse_rcv_line
 from app.serial_manager import SerialVehicleLink, validate_port_arg
-from app.telemetry_hub import TelemetryHub
+from app.telemetry_hub import TelemetryHub, json_safe
 
 
 @pytest.fixture()
@@ -31,6 +38,8 @@ def test_health_never_500(client: TestClient):
     body = r.json()
     assert body["status"] == "ok"
     assert body["phase"] >= 11
+    assert body["v2_phase"] == 14
+    assert "phase14" in body["version"]
     assert "tiles_dir" in body
     assert "logs_dir" in body
 
@@ -70,45 +79,46 @@ def test_validate_port_arg():
 
 def test_hub_survives_garbage_bytes():
     hub = TelemetryHub()
-    parser = FrameParser()
+    parser = RadioLineBuffer()
     garbage = bytes(range(256)) * 50
-    frames = parser.feed(garbage)
-    for fr in frames:
-        hub.ingest_raw_frame("rocket", fr)
-    # Valid frame still works after garbage
-    wire = encode_packet(
-        VEHICLE_ROCKET,
-        1,
-        TelemetryFrame(
-            timestamp_ms=1,
-            altitude_m=5.0,
-            pressure_hpa=1000.0,
-            temperature_c=20.0,
-            accel_x=0.0,
-            accel_y=0.0,
-            accel_z=9.8,
-            gyro_x=0.0,
-            gyro_y=0.0,
-            gyro_z=0.0,
-            pitch=0.0,
-            yaw=0.0,
-            roll=0.0,
-            battery_v=7.4,
-        ),
+    for item in parser.feed(garbage):
+        if hasattr(item, "data"):
+            hub.ingest_radio_packet("rocket", item)
+    rec = TelemetryRecord(
+        team_id="XXXX",
+        timestamp="00:00:01",
+        packet_count=1,
+        altitude_m=5.0,
+        pressure=1000.0,
+        temp_c=20.0,
+        voltage=7.4,
+        gnss_time="00:00:01",
+        gnss_lat=12.97,
+        gnss_lon=77.59,
+        gnss_alt_m=925.0,
+        gnss_sats=6,
+        accel_x=0.0,
+        accel_y=0.0,
+        accel_z=9.8,
+        gyro_x=0.0,
+        gyro_y=0.0,
+        gyro_z=0.0,
+        flight_software_state=int(FlightState.LAUNCH_PAD),
     )
-    for fr in parser.feed(wire):
-        hub.ingest_raw_frame(
-            "rocket",
-            fr,
-            {
-                "frames_ok": parser.frames_ok,
-                "frames_crc_error": parser.frames_crc_error,
-                "frames_resynced": parser.frames_resynced,
-            },
-        )
+    pkt = parse_rcv_line(format_rcv_line(1, format_telemetry_csv(rec), -65, 7.0))
+    assert pkt is not None
+    hub.ingest_radio_packet(
+        "rocket",
+        pkt,
+        {
+            "frames_ok": parser.stats.rcv_ok + 1,
+            "frames_crc_error": parser.stats.rcv_malformed,
+            "frames_resynced": parser.oversize_resets,
+        },
+    )
     snap = hub.latest_state("rocket")
     assert snap["telemetry"]["altitude_m"] == pytest.approx(5.0)
-    assert parser.frames_crc_error >= 0  # may be high after garbage
+    assert parser.stats.rcv_malformed >= 0
 
 
 def test_serial_link_bad_port_thread_exits_cleanly():
@@ -149,3 +159,38 @@ def test_malformed_simulate_body(client: TestClient):
     r = client.post("/simulate", json={"vehicle": "not_a_vehicle", "enabled": True})
     assert r.status_code == 400
     assert client.get("/health").status_code == 200
+
+
+def test_garbage_json_does_not_kill_health(client: TestClient):
+    r = client.post(
+        "/simulate",
+        data="{not-json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code in (400, 422)
+    assert client.get("/health").status_code == 200
+
+
+def test_json_safe_strips_nan_and_inf():
+    out = json_safe({"a": float("nan"), "b": float("inf"), "c": [1.0]})
+    assert out["a"] is None
+    assert out["b"] is None
+    assert out["c"] == [1.0]
+    assert math.isnan(float("nan"))
+
+
+def test_snapshot_is_json_dumpable():
+    hub = TelemetryHub()
+    snap = hub.latest_state("rocket")
+    json.dumps(snap, allow_nan=False)
+
+
+def test_malformed_rcv_does_not_crash_hub():
+    hub = TelemetryHub()
+    buf = RadioLineBuffer()
+    items = buf.feed(b"+RCV=broken\r\n+OK\r\n")
+    for item in items:
+        hub.ingest_radio_event("rocket", item)
+    snap = hub.packets_snapshot("rocket")
+    json.dumps(snap, allow_nan=False)
+    assert snap["transport_malformed"] >= 1

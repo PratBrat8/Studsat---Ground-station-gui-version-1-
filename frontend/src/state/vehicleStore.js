@@ -5,11 +5,15 @@
  */
 import { create } from 'zustand';
 import { capHistory } from '../services/wsClient.js';
+import { isValidGps } from '../utils/mapsHandoff.js';
 
 const HISTORY_CAP = 600;
 
 const emptyTelemetry = {
   altitude_m: null,
+  altitude_gnss_m: null,
+  altitude_delta_m: null,
+  altitude_disagreement: false,
   speed_mps: null,
   pitch: null,
   yaw: null,
@@ -17,6 +21,10 @@ const emptyTelemetry = {
   temperature_c: null,
   pressure_hpa: null,
   battery_v: null,
+  battery_pct: null,
+  battery_pct_assumed: true,
+  current_a: null,
+  power_w: null,
   accel_x: null,
   accel_y: null,
   accel_z: null,
@@ -24,6 +32,17 @@ const emptyTelemetry = {
   gyro_y: null,
   gyro_z: null,
   timestamp_ms: null,
+  packet_count: null,
+  rssi: null,
+  snr: null,
+  flight_software_state: null,
+};
+
+const emptySignal = {
+  rssi: null,
+  snr: null,
+  rssi_history: [],
+  snr_history: [],
 };
 
 const emptyGps = {
@@ -35,6 +54,16 @@ const emptyGps = {
   fix_type: 0,
   gps_timestamp: null,
 };
+
+const emptyTrajectory = () => ({
+  origin: null,
+  range_m: null,
+  climb_deg: null,
+  climb_source: 'none',
+  trend_active: false,
+  trend: [],
+  path: [],
+});
 
 const emptyLink = {
   state: 'DISCONNECTED',
@@ -107,24 +136,45 @@ export function createVehicleStore(vehicleId) {
     link: { ...emptyLink },
     telemetry: { ...emptyTelemetry },
     gps: { ...emptyGps },
+    lastGps: { lat: null, lon: null, t: null },
+    signal: { ...emptySignal },
+    lastCommand: null,
+    commands: [],
     prediction: null,
+    trajectory: emptyTrajectory(),
     events: [],
+    cansat_separated: false,
     history: emptyHistory(),
     trail: [],
     packets: {
       frames_ok: 0,
       frames_crc_error: 0,
       frames_resynced: 0,
+      transport_malformed: 0,
+      transport_ok: 0,
+      transport_err: 0,
+      transport_unknown: 0,
+      app_parse_error: 0,
+      app_field_count_error: 0,
+      app_type_error: 0,
+      rssi: null,
+      snr: null,
       packet_rate_hz: 0,
       last_seq: null,
       last_seq_gap: 0,
       total_seq_gaps: 0,
+      last_packet_age_s: null,
       rate_history: [],
       recent: [],
       last_by_type: {},
     },
 
     setWsConnected: (wsConnected) => set({ wsConnected }),
+
+    setLastCommand: (lastCommand) => set({ lastCommand }),
+
+    setCommands: (commands) =>
+      set({ commands: Array.isArray(commands) ? commands : [] }),
 
     applyUpdate: (msg) => {
       // Phase 11: never throw — bad WS payloads are dropped
@@ -138,6 +188,13 @@ export function createVehicleStore(vehicleId) {
               ? { ...state.telemetry, ...msg.telemetry }
               : state.telemetry;
             const gps = msg.gps ? { ...state.gps, ...msg.gps } : state.gps;
+            const lastGps = isValidGps(gps.lat, gps.lon)
+              ? {
+                  lat: Number(gps.lat),
+                  lon: Number(gps.lon),
+                  t: msg.t ?? state.lastUpdateT,
+                }
+              : state.lastGps;
             const link = msg.link ? { ...state.link, ...msg.link } : state.link;
             const nextPhase = msg.phase ?? state.phase;
             const prev_phase =
@@ -166,6 +223,43 @@ export function createVehicleStore(vehicleId) {
               trail = capHistory([...state.trail, ...msg.trail_point], 2000);
             }
 
+            let trajectory = state.trajectory || emptyTrajectory();
+            if (msg.trajectory && typeof msg.trajectory === 'object') {
+              const tmsg = msg.trajectory;
+              let path = trajectory.path || [];
+              if (Array.isArray(tmsg.path)) {
+                path = tmsg.path.slice(-2000);
+              } else if (Array.isArray(tmsg.path_point) && tmsg.path_point.length) {
+                path = capHistory([...path, ...tmsg.path_point], 2000);
+              }
+              trajectory = {
+                origin: tmsg.origin !== undefined ? tmsg.origin : trajectory.origin,
+                range_m:
+                  tmsg.range_m !== undefined ? tmsg.range_m : trajectory.range_m,
+                climb_deg:
+                  tmsg.climb_deg !== undefined
+                    ? tmsg.climb_deg
+                    : trajectory.climb_deg,
+                climb_source: tmsg.climb_source || trajectory.climb_source,
+                trend_active: Boolean(tmsg.trend_active),
+                trend: Array.isArray(tmsg.trend) ? tmsg.trend : [],
+                path,
+              };
+            }
+
+            const signal = msg.signal
+              ? {
+                  rssi: msg.signal.rssi ?? state.signal.rssi,
+                  snr: msg.signal.snr ?? state.signal.snr,
+                  rssi_history: Array.isArray(msg.signal.rssi_history)
+                    ? msg.signal.rssi_history
+                    : state.signal.rssi_history,
+                  snr_history: Array.isArray(msg.signal.snr_history)
+                    ? msg.signal.snr_history
+                    : state.signal.snr_history,
+                }
+              : state.signal;
+
             const packets = msg.packets
               ? {
                   frames_ok: msg.packets.frames_ok ?? state.packets.frames_ok,
@@ -174,6 +268,34 @@ export function createVehicleStore(vehicleId) {
                     state.packets.frames_crc_error,
                   frames_resynced:
                     msg.packets.frames_resynced ?? state.packets.frames_resynced,
+                  transport_malformed:
+                    msg.packets.transport_malformed ??
+                    msg.packets.frames_crc_error ??
+                    state.packets.transport_malformed,
+                  transport_ok:
+                    msg.packets.transport_ok ?? state.packets.transport_ok,
+                  transport_err:
+                    msg.packets.transport_err ?? state.packets.transport_err,
+                  transport_unknown:
+                    msg.packets.transport_unknown ??
+                    state.packets.transport_unknown,
+                  app_parse_error:
+                    msg.packets.app_parse_error ??
+                    state.packets.app_parse_error,
+                  app_field_count_error:
+                    msg.packets.app_field_count_error ??
+                    state.packets.app_field_count_error,
+                  app_type_error:
+                    msg.packets.app_type_error ??
+                    state.packets.app_type_error,
+                  rssi:
+                    msg.packets.rssi !== undefined
+                      ? msg.packets.rssi
+                      : state.packets.rssi,
+                  snr:
+                    msg.packets.snr !== undefined
+                      ? msg.packets.snr
+                      : state.packets.snr,
                   packet_rate_hz:
                     msg.packets.packet_rate_hz ?? state.packets.packet_rate_hz,
                   last_seq:
@@ -184,6 +306,9 @@ export function createVehicleStore(vehicleId) {
                     msg.packets.last_seq_gap ?? state.packets.last_seq_gap,
                   total_seq_gaps:
                     msg.packets.total_seq_gaps ?? state.packets.total_seq_gaps,
+                  last_packet_age_s:
+                    msg.packets.last_packet_age_s ??
+                    state.packets.last_packet_age_s,
                   rate_history: Array.isArray(msg.packets.rate_history)
                     ? msg.packets.rate_history
                     : state.packets.rate_history,
@@ -204,11 +329,18 @@ export function createVehicleStore(vehicleId) {
               link,
               telemetry,
               gps,
+              lastGps,
+              signal,
               prediction:
                 msg.prediction !== undefined
                   ? msg.prediction
                   : state.prediction,
+              trajectory,
               events: Array.isArray(msg.events) ? msg.events : state.events,
+              cansat_separated:
+                msg.cansat_separated !== undefined
+                  ? Boolean(msg.cansat_separated)
+                  : state.cansat_separated,
               history,
               trail,
               packets,
@@ -232,18 +364,33 @@ export function createVehicleStore(vehicleId) {
         link: { ...emptyLink },
         telemetry: { ...emptyTelemetry },
         gps: { ...emptyGps },
+        signal: { ...emptySignal },
+        lastCommand: null,
+        commands: [],
         prediction: null,
+        trajectory: emptyTrajectory(),
         events: [],
+        cansat_separated: false,
         history: emptyHistory(),
         trail: [],
         packets: {
           frames_ok: 0,
           frames_crc_error: 0,
           frames_resynced: 0,
+          transport_malformed: 0,
+          transport_ok: 0,
+          transport_err: 0,
+          transport_unknown: 0,
+          app_parse_error: 0,
+          app_field_count_error: 0,
+          app_type_error: 0,
+          rssi: null,
+          snr: null,
           packet_rate_hz: 0,
           last_seq: null,
           last_seq_gap: 0,
           total_seq_gaps: 0,
+          last_packet_age_s: null,
           rate_history: [],
           recent: [],
           last_by_type: {},

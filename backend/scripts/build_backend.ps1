@@ -1,4 +1,4 @@
-# Build studsat-backend.exe with PyInstaller (Phase 12).
+# Build studsat-backend.exe with PyInstaller (Phase 14).
 # Run from anywhere; switches to backend/ directory.
 $ErrorActionPreference = "Stop"
 $BackendRoot = Split-Path -Parent $PSScriptRoot

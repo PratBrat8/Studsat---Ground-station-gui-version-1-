@@ -4,6 +4,7 @@ frontend/node_modules/
 electron/node_modules/
 .venv/
 venv/
+tools/cad-venv/
 __pycache__/
 *.py[cod]
 *.egg-info/

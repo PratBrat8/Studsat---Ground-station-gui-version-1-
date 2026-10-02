@@ -19,6 +19,8 @@ export default defineConfig({
       '/disconnect': 'http://127.0.0.1:8765',
       '/simulate': 'http://127.0.0.1:8765',
       '/recover': 'http://127.0.0.1:8765',
+      '/command': 'http://127.0.0.1:8765',
+      '/commands': 'http://127.0.0.1:8765',
       '/packets': 'http://127.0.0.1:8765',
       '/replay': {
         target: 'http://127.0.0.1:8765',

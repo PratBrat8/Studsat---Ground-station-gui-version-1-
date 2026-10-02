@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   MapContainer,
   TileLayer,
@@ -11,11 +11,13 @@ import { useVehicleStore } from '../../state/vehicleStore.js';
 import {
   DEFAULT_MAP_CENTER,
   DEFAULT_MAP_ZOOM,
+  fetchTilesInfo,
   getTileUrlTemplate,
 } from '../../services/tiles.js';
 import TrailLayer from './TrailLayer.jsx';
 import LandingMarker from './LandingMarker.jsx';
 import { fmt } from '../../utils/format.js';
+import { openGoogleMapsHandoff } from '../../utils/mapsHandoff.js';
 
 /** DivIcon — no CDN marker images (offline hard requirement). */
 function makeVehicleIcon(vehicle, isLive) {
@@ -72,15 +74,19 @@ function ResizeInvalidator() {
 }
 
 /**
- * Offline map panel — local TileLayer only (PRD G8 / Phase 6).
+ * Offline map panel + Google Maps handoff (PRD G8 / A.5.10 / Phase 7).
  */
 export default function MapPanel({ vehicle }) {
   const useStore = useVehicleStore(vehicle);
   const gps = useStore((s) => s.gps);
+  const lastGps = useStore((s) => s.lastGps);
   const trail = useStore((s) => s.trail);
   const prediction = useStore((s) => s.prediction);
   const phase = useStore((s) => s.phase);
   const linkState = useStore((s) => s.link.state);
+  const [tileInfo, setTileInfo] = useState(null);
+  const [handoffError, setHandoffError] = useState(null);
+  const [handoffBusy, setHandoffBusy] = useState(false);
 
   const hasFix =
     gps.lat != null &&
@@ -102,7 +108,43 @@ export default function MapPanel({ vehicle }) {
   const showLanding =
     prediction &&
     prediction.lat != null &&
-    (phase === 'DESCENT' || phase === 'APOGEE' || phase === 'LANDED');
+    (phase === 'DESCENT' ||
+      phase === 'APOGEE' ||
+      phase === 'PAYLOAD_SEP' ||
+      phase === 'AEROBREAK_RELEASE' ||
+      phase === 'IMPACT' ||
+      phase === 'LANDED');
+
+  const handoffLat = lastGps?.lat;
+  const handoffLon = lastGps?.lon;
+  const canHandoff = handoffLat != null && handoffLon != null;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchTilesInfo()
+      .then((info) => {
+        if (!cancelled) setTileInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setTileInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onHandoff = async () => {
+    if (!canHandoff || handoffBusy) return;
+    setHandoffError(null);
+    setHandoffBusy(true);
+    try {
+      await openGoogleMapsHandoff(handoffLat, handoffLon);
+    } catch (err) {
+      setHandoffError(err.message || String(err));
+    } finally {
+      setHandoffBusy(false);
+    }
+  };
 
   return (
     <div className="map-panel" aria-label={`${vehicle} map`}>
@@ -122,8 +164,23 @@ export default function MapPanel({ vehicle }) {
           </div>
         </div>
         <div className="map-badges">
-          <span className="link-pill mode">LOCAL TILES</span>
+          <span className="link-pill mode">
+            {tileInfo?.using_placeholders ? 'PLACEHOLDER TILES' : 'LOCAL TILES'}
+          </span>
           {!hasFix && <span className="link-pill">NO FIX</span>}
+          <button
+            type="button"
+            className="btn"
+            disabled={!canHandoff || handoffBusy}
+            onClick={onHandoff}
+            title={
+              canHandoff
+                ? `Opens ${handoffLat.toFixed(6)}, ${handoffLon.toFixed(6)} in the system browser. Needs internet.`
+                : 'Waiting for a GPS fix'
+            }
+          >
+            Google Maps
+          </button>
         </div>
       </div>
 
@@ -163,8 +220,18 @@ export default function MapPanel({ vehicle }) {
 
       <div className="map-footer muted small">
         Tiles: <code>{tileUrl}</code>
+        {tileInfo?.tile_file_count != null
+          ? ` · ${tileInfo.tile_file_count} local files`
+          : ''}
         {' · '}
-        Drop XYZ files into <code>tiles/z/x/y.png</code> for real basemap
+        Drop XYZ files into <code>tiles/z/x/y.png</code> for a real basemap.
+        {' · '}
+        <strong>Google Maps</strong> opens the last known fix in the system
+        browser and needs internet at click time.
+        {canHandoff
+          ? ` Last known ${handoffLat.toFixed(6)}, ${handoffLon.toFixed(6)}.`
+          : ' Button stays disabled until a GPS fix arrives.'}
+        {handoffError ? ` · ${handoffError}` : ''}
       </div>
     </div>
   );

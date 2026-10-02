@@ -54,17 +54,24 @@ export default function FieldTable({ packet, lastByType }) {
           <span>
             {packet.type_name || TYPE_LABELS[packet.type] || `type ${packet.type}`}
           </span>
+          <span>{packet.layer === 'transport' ? 'transport' : 'application'}</span>
           <span>seq {packet.seq ?? '—'}</span>
           <span>len {packet.len ?? '—'}</span>
+          {packet.rssi != null && <span>RSSI {packet.rssi} dBm</span>}
+          {packet.snr != null && <span>SNR {packet.snr}</span>}
           <span className={packet.ok === false ? 'bad' : 'ok'}>
-            {packet.ok === false ? `ERR ${packet.error || ''}` : 'CRC OK'}
+            {packet.ok === false
+              ? `ERR ${packet.error || ''}`
+              : packet.layer === 'transport'
+                ? 'AT OK'
+                : 'CSV OK'}
           </span>
         </div>
       )}
 
       {packet?.error && (
         <div className="banner error" style={{ margin: '0.35rem 0' }}>
-          Decode: {packet.error}
+          {packet.layer === 'transport' ? 'Transport' : 'Application'}: {packet.error}
         </div>
       )}
 

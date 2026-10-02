@@ -1,145 +1,123 @@
-"""Unit tests for protocol encode/decode and CRC (PRD Phase 2)."""
+"""CSV telemetry + CMD builders (PRD v2 Phase 2)."""
 from __future__ import annotations
 
-import struct
 import sys
 from pathlib import Path
 
 import pytest
 
-# Allow `pytest` from backend/ or repo root
 _BACKEND = Path(__file__).resolve().parents[1]
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from app.protocol import (
-    GPS_PAYLOAD_SIZE,
-    STATUS_PAYLOAD_SIZE,
-    SYNC0,
-    SYNC1,
-    TELEMETRY_PAYLOAD_SIZE,
-    TYPE_EVENT,
-    TYPE_GPS,
-    TYPE_STATUS,
-    TYPE_TELEMETRY,
+    CSV_FIELD_COUNT,
     VEHICLE_ROCKET,
-    VEHICLE_SATELLITE,
-    EventFrame,
-    GpsFrame,
-    ProtocolError,
-    StatusFrame,
-    TelemetryFrame,
-    crc16_ccitt,
-    decode_payload,
-    encode_frame,
-    encode_packet,
-    encode_telemetry,
+    CsvParseStats,
+    FlightState,
+    TelemetryRecord,
+    cmd_calibrate,
+    cmd_manual_ejection,
+    cmd_set_time,
+    cmd_telemetry_power,
+    format_telemetry_csv,
+    parse_telemetry_csv,
+    vehicle_name,
+    vehicle_reyax_addr,
 )
 
 
-def _sample_telem(**overrides) -> TelemetryFrame:
+def _sample(**overrides) -> TelemetryRecord:
     base = dict(
-        timestamp_ms=12_345,
+        team_id="XXXX",
+        timestamp="00:00:05",
+        packet_count=12,
         altitude_m=812.4,
-        pressure_hpa=934.2,
-        temperature_c=21.4,
+        pressure=934.2,
+        temp_c=21.4,
+        voltage=7.6,
+        gnss_time="00:00:05",
+        gnss_lat=12.9716,
+        gnss_lon=77.5946,
+        gnss_alt_m=1732.4,
+        gnss_sats=10,
         accel_x=0.1,
         accel_y=-0.2,
         accel_z=9.81,
         gyro_x=1.0,
         gyro_y=2.0,
-        gyro_z=3.0,
-        pitch=12.3,
-        yaw=88.0,
-        roll=-4.1,
-        battery_v=7.62,
+        gyro_z=0.5,
+        flight_software_state=int(FlightState.ASCENT),
     )
     base.update(overrides)
-    return TelemetryFrame(**base)
+    return TelemetryRecord(**base)
 
 
-def test_telemetry_payload_size():
-    assert TELEMETRY_PAYLOAD_SIZE == 56
-    assert GPS_PAYLOAD_SIZE == 30
-    assert STATUS_PAYLOAD_SIZE == 6
+def test_csv_field_count_is_19_with_3_accel_3_gyro():
+    assert CSV_FIELD_COUNT == 19
+    line = format_telemetry_csv(_sample())
+    assert len(line.split(",")) == 19
 
 
-def test_crc16_known_vector():
-    # Self-consistency + non-trivial output for empty/simple inputs
-    assert crc16_ccitt(b"") == 0xFFFF
-    c1 = crc16_ccitt(b"123456789")
-    # CRC-16/CCITT-FALSE ("123456789") classic check value is 0x29B1
-    assert c1 == 0x29B1
-    assert crc16_ccitt(b"\x01\x02") != crc16_ccitt(b"\x02\x01")
+def test_roundtrip_csv():
+    stats = CsvParseStats()
+    original = _sample()
+    parsed = parse_telemetry_csv(format_telemetry_csv(original), stats)
+    assert parsed is not None
+    assert stats.ok == 1
+    assert parsed.team_id == "XXXX"
+    assert parsed.packet_count == 12
+    assert parsed.accel_x == pytest.approx(0.1, abs=0.001)
+    assert parsed.accel_y == pytest.approx(-0.2, abs=0.001)
+    assert parsed.accel_z == pytest.approx(9.81, abs=0.001)
+    assert parsed.gyro_x == pytest.approx(1.0, abs=0.001)
+    assert parsed.gyro_y == pytest.approx(2.0, abs=0.001)
+    assert parsed.gyro_z == pytest.approx(0.5, abs=0.001)
+    assert parsed.flight_software_state == int(FlightState.ASCENT)
 
 
-def test_encode_decode_telemetry_roundtrip():
-    t = _sample_telem()
-    payload = encode_telemetry(t)
-    assert len(payload) == TELEMETRY_PAYLOAD_SIZE
-    decoded = decode_payload(TYPE_TELEMETRY, payload)
-    assert isinstance(decoded, TelemetryFrame)
-    assert decoded.timestamp_ms == t.timestamp_ms
-    assert decoded.altitude_m == pytest.approx(t.altitude_m)
-    assert decoded.battery_v == pytest.approx(t.battery_v)
-    assert decoded.pitch == pytest.approx(t.pitch)
+def test_wrong_field_count_returns_none():
+    stats = CsvParseStats()
+    line = format_telemetry_csv(_sample())
+    short = ",".join(line.split(",")[:-1])
+    assert parse_telemetry_csv(short, stats) is None
+    assert stats.field_count_error == 1
+    assert stats.ok == 0
 
 
-def test_encode_decode_gps_roundtrip():
-    g = GpsFrame(
-        gps_timestamp=99,
-        lat=12.9716,
-        lon=77.5946,
-        alt_msl_m=910.5,
-        num_sats=9,
-        hdop=0.9,
-        fix_type=2,
-    )
-    wire = encode_packet(VEHICLE_ROCKET, 7, g)
-    assert wire[0] == SYNC0 and wire[1] == SYNC1
-    assert wire[2] == VEHICLE_ROCKET
-    assert wire[3] == TYPE_GPS
-    assert wire[4] == 7
-    assert wire[5] == GPS_PAYLOAD_SIZE
-    payload = wire[6 : 6 + GPS_PAYLOAD_SIZE]
-    decoded = decode_payload(TYPE_GPS, payload)
-    assert isinstance(decoded, GpsFrame)
-    assert decoded.lat == pytest.approx(12.9716)
-    assert decoded.lon == pytest.approx(77.5946)
-    assert decoded.num_sats == 9
-    assert decoded.fix_type == 2
+def test_non_numeric_field_returns_none():
+    stats = CsvParseStats()
+    line = format_telemetry_csv(_sample())
+    parts = line.split(",")
+    parts[3] = "not-a-number"  # ALTITUDE
+    assert parse_telemetry_csv(",".join(parts), stats) is None
+    assert stats.type_error == 1
 
 
-def test_encode_decode_status_and_event():
-    s = StatusFrame(phase_hint=0, battery_v=7.5, error_flags=0x03)
-    decoded_s = decode_payload(TYPE_STATUS, encode_packet(VEHICLE_SATELLITE, 1, s)[6:-2])
-    # easier via encode helpers
-    from app.protocol import encode_status
-
-    decoded_s = decode_payload(TYPE_STATUS, encode_status(s))
-    assert decoded_s.battery_v == pytest.approx(7.5)
-    assert decoded_s.error_flags == 0x03
-
-    e = EventFrame(message="LAUNCH_DETECT")
-    wire = encode_packet(VEHICLE_ROCKET, 2, e)
-    assert wire[3] == TYPE_EVENT
-    decoded_e = decode_payload(TYPE_EVENT, wire[6:-2])
-    assert decoded_e.message == "LAUNCH_DETECT"
+def test_empty_and_none():
+    stats = CsvParseStats()
+    assert parse_telemetry_csv("", stats) is None
+    assert parse_telemetry_csv("   \r\n", stats) is None
+    assert parse_telemetry_csv(None, stats) is None  # type: ignore[arg-type]
+    assert stats.field_count_error == 3
 
 
-def test_frame_crc_covers_header_and_payload():
-    t = _sample_telem()
-    wire = encode_packet(VEHICLE_ROCKET, 0xAB, t)
-    body = wire[2:-2]
-    crc_wire = struct.unpack("<H", wire[-2:])[0]
-    assert crc16_ccitt(body) == crc_wire
+def test_command_builders():
+    assert cmd_telemetry_power("XXXX", True) == "CMD,XXXX,TX,ON"
+    assert cmd_telemetry_power("XXXX", False) == "CMD,XXXX,TX,OFF"
+    assert cmd_set_time("XXXX", "12:34:56") == "CMD,XXXX,ST,12:34:56"
+    assert cmd_calibrate("XXXX", "CG") == "CMD,XXXX,CG,R"
+    assert cmd_calibrate("XXXX", "cb") == "CMD,XXXX,CB,R"
+    assert cmd_calibrate("XXXX", "CA") == "CMD,XXXX,CA,R"
+    with pytest.raises(ValueError):
+        cmd_calibrate("XXXX", "XX")
 
 
-def test_encode_frame_rejects_oversize_payload():
-    with pytest.raises(ProtocolError):
-        encode_frame(VEHICLE_ROCKET, TYPE_TELEMETRY, 0, b"x" * 256)
+def test_manual_ejection_command_string():
+    # Routing onto the rocket radio is Phase 3; the payload is this string.
+    assert cmd_manual_ejection("XXXX") == "CMD,XXXX,EJ,R"
 
 
-def test_unknown_packet_type_raises():
-    with pytest.raises(ProtocolError):
-        decode_payload(0x7F, b"\x00")
+def test_vehicle_helpers():
+    assert vehicle_name(VEHICLE_ROCKET) == "rocket"
+    assert vehicle_reyax_addr(VEHICLE_ROCKET) == 1

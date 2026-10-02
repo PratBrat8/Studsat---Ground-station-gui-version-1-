@@ -16,14 +16,28 @@ export function getApiBase() {
 }
 
 async function request(path, options = {}) {
-  const res = await fetch(`${getApiBase()}${path}`, {
-    headers: {
-      Accept: 'application/json',
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...options.headers,
-    },
-    ...options,
-  });
+  const { timeoutMs = 8000, ...fetchOpts } = options;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${getApiBase()}${path}`, {
+      headers: {
+        Accept: 'application/json',
+        ...(fetchOpts.body ? { 'Content-Type': 'application/json' } : {}),
+        ...fetchOpts.headers,
+      },
+      ...fetchOpts,
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('backend timeout');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   let data = null;
   const text = await res.text();
   if (text) {
@@ -81,6 +95,24 @@ export async function markRecovered(vehicle) {
   });
 }
 
+// --- Uplink commands (PRD v2 Phase 3–4) ---
+
+export async function sendCommand(vehicle, type, extra = {}) {
+  const body = { vehicle, type, ...extra };
+  return request('/command', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listCommands(vehicle = null, limit = 50) {
+  const q = new URLSearchParams();
+  if (vehicle) q.set('vehicle', vehicle);
+  if (limit) q.set('limit', String(limit));
+  const suffix = q.toString() ? `?${q}` : '';
+  return request(`/commands${suffix}`);
+}
+
 // --- Replay / logs (Phase 10) ---
 
 export async function listReplaySessions() {
@@ -116,4 +148,10 @@ export async function setReplaySpeed(speed) {
 
 export async function fetchReplayStatus() {
   return request('/replay/status');
+}
+
+export async function fetchReplayCommands(filename) {
+  const q = new URLSearchParams();
+  if (filename) q.set('filename', filename);
+  return request(`/replay/commands?${q}`);
 }

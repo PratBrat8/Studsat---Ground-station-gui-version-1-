@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec — Phase 12 packaging (PRD C.7).
+# PyInstaller spec — Phase 14 packaging (PRD v2 D.14 / C.7).
 # Build from backend/:  pyinstaller build_backend.spec
 # Output: dist/studsat-backend.exe
+# Do not bundle CadQuery, STEP files, or tools/cad-venv (build-time CAD only).
 
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_all
@@ -39,12 +40,16 @@ hidden = [
     'app.main',
     'app.config',
     'app.protocol',
+    'app.radio_transport',
+    'app.power',
+    'app.command_manager',
     'app.frame_parser',
     'app.serial_manager',
     'app.simulator',
     'app.telemetry_hub',
     'app.phase_fsm',
     'app.predictor',
+    'app.trajectory',
     'app.logger',
     'app.connection_manager',
     'app.rest_routes',
@@ -68,7 +73,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib', 'scipy', 'PIL', 'IPython'],
+    excludes=['tkinter', 'matplotlib', 'scipy', 'PIL', 'IPython', 'cadquery'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
